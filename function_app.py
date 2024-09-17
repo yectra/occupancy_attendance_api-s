@@ -35,6 +35,7 @@ blob_container_client = blob_service_client.get_container_client(BLOB_CONTAINER_
 
 print('Successfully connected all the strings')
                                         # get employee
+# GET Employee
 @app.function_name(name="get_employee")
 @app.route(route='employee/{employee_id}', methods=[func.HttpMethod.GET])
 def get_employee(req: func.HttpRequest) -> func.HttpResponse:
@@ -46,7 +47,7 @@ def get_employee(req: func.HttpRequest) -> func.HttpResponse:
         employee_id = int(employee_id)
 
         # Query to fetch employee record by employee_Id
-        query = "SELECT * FROM c WHERE c.employee_Id = @employee_id"
+        query = "SELECT * FROM c WHERE c.employeeId = @employee_id"
         parameters = [{"name": "@employee_id", "value": employee_id}]
         items = list(employee_container.query_items(query=query, parameters=parameters, enable_cross_partition_query=True))
 
@@ -93,7 +94,7 @@ def get_all_employees(req: func.HttpRequest) -> func.HttpResponse:
             status_code=500,
             mimetype="application/json"
         )
-# search attendance
+# Search Attendance
 @app.function_name(name="search_attendance")
 @app.route(route='attendance/search', methods=[func.HttpMethod.GET])
 def search_attendance(req: func.HttpRequest) -> func.HttpResponse:
@@ -113,11 +114,11 @@ def search_attendance(req: func.HttpRequest) -> func.HttpResponse:
         query_conditions = []
 
         if employee_id:
-            query_conditions.append(f"c['employee_Id'] = {employee_id}")
+            query_conditions.append(f"c.employeeId = {employee_id}")
         if employee_name:
-            query_conditions.append(f"c['employee_Name'] = '{employee_name}'")
+            query_conditions.append(f"c.employeeName = '{employee_name}'")
         if date:
-            query_conditions.append(f"c.Date = '{date}'")
+            query_conditions.append(f"c.date = '{date}'")
 
         # Combine conditions with AND
         query = "SELECT * FROM c WHERE " + " AND ".join(query_conditions)
@@ -146,6 +147,7 @@ def search_attendance(req: func.HttpRequest) -> func.HttpResponse:
             status_code=500,
             mimetype="application/json"
         )
+
 
 
 
@@ -183,8 +185,7 @@ def delete_image_from_blob(blob_url):
     except Exception as e:
         print(f"Error deleting image from blob: {e}")
 
-                    # Define the Azure Function for adding an employee
-
+# Define the Azure Function for adding an employee
 @app.function_name(name="add_employee")
 @app.route(route='employee', methods=[func.HttpMethod.POST])
 def add_employee(req: func.HttpRequest) -> func.HttpResponse:
@@ -200,13 +201,13 @@ def add_employee(req: func.HttpRequest) -> func.HttpResponse:
             )
 
         # Extract fields from the JSON data
-        employee_id = json_data.get('employee_Id')
-        name = json_data.get('employee_Name')
+        employee_id = json_data.get('employeeId')
+        name = json_data.get('employeeName')
         role = json_data.get('role')
         email = json_data.get('email')
         action = json_data.get('action')
-        base64_image = json_data.get('ImageBase64')  # Base64-encoded image
-        date_of_joining = json_data.get('date_of_joining')  # New field
+        base64_image = json_data.get('imageBase64')  # Base64-encoded image
+        date_of_joining = json_data.get('dateOfJoining')  # New field
 
         # Check if required fields are provided
         if not employee_id or not name or not role or not email or not action or not date_of_joining:
@@ -222,13 +223,13 @@ def add_employee(req: func.HttpRequest) -> func.HttpResponse:
         # Create the employee record
         employee_record = {
             'id': str(uuid.uuid4()),
-            'employee_Id': employee_id,
-            'employee_Name': name,
+            'employeeId': employee_id,
+            'employeeName': name,
             'role': role,
             'email': email,
             'action': action,
-            'image_Url': image_url,
-            'date_of_joining': date_of_joining,  # Add date_of_joining field
+            'imageUrl': image_url,
+            'dateOfJoining': date_of_joining,  # Add dateOfJoining field
         }
 
         # Save the employee record in Cosmos DB
@@ -255,17 +256,17 @@ def add_employee(req: func.HttpRequest) -> func.HttpResponse:
 
 @app.function_name(name="update_employee")
 @app.route(route="update-employee/{employee_id}", methods=[func.HttpMethod.PUT])
-def main(req: func.HttpRequest) -> func.HttpResponse:
+def update_employee(req: func.HttpRequest) -> func.HttpResponse:
     logging.info('Processing update employee request.')
 
     try:
         employee_id = int(req.route_params.get('employee_id'))
         logging.info(f"Employee ID received: {employee_id}")
         data = req.get_json()
-        base64_image = data.get('ImageBase64')
+        base64_image = data.get('imageBase64')
 
         # Fetch the existing employee record
-        query = f"SELECT * FROM c WHERE c.employee_Id = {employee_id}"
+        query = f"SELECT * FROM c WHERE c.employeeId = {employee_id}"
         logging.info(f"Query: {query}")
         items = list(employee_container.query_items(query=query, enable_cross_partition_query=True))
         logging.info(f"Items found: {items}")
@@ -276,9 +277,9 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             # Upload new image if provided
             if base64_image:
                 image_url = upload_image_to_blob(base64_image, employee_id)
-                if item.get('image_Url'):
-                    delete_image_from_blob(item['image_Url'])  # Delete the old image from blob storage
-                item['image_Url'] = image_url
+                if item.get('imageUrl'):
+                    delete_image_from_blob(item['imageUrl'])  # Delete the old image from blob storage
+                item['imageUrl'] = image_url
             
             # Update other fields
             item.update(data)
@@ -288,6 +289,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                 status_code=200,
                 mimetype="application/json"
             )
+        
         return func.HttpResponse(
             json.dumps({'message': 'Employee not found'}),
             status_code=404,
@@ -300,6 +302,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             status_code=500,
             mimetype="application/json"
         )
+
     
 
                     # Define the Azure Function for delete an employee
@@ -314,7 +317,7 @@ def delete_employee(req: func.HttpRequest) -> func.HttpResponse:
         employee_id = req.route_params.get('employee_id')
         
         # Query to fetch the employee record by id
-        query = f"SELECT * FROM c WHERE c.employee_Id = {employee_id}"
+        query = f"SELECT * FROM c WHERE c.employeeId = {employee_id}"
         logging.info(f"Query: {query}")
         items = list(employee_container.query_items(query=query, enable_cross_partition_query=True))
         logging.info(f"Items found: {items}")
@@ -342,91 +345,61 @@ def delete_employee(req: func.HttpRequest) -> func.HttpResponse:
             body=json.dumps({'error': str(e)}),
             status_code=500,
             mimetype="application/json"
-        )    
+        )
+
     
 
-    # Attendance API's
+    
+    # Attendance API's all,date,id
 
-                                            # 1.get_attendance_emp_id,date
+
+
 
 
 @app.function_name(name="get_attendance")
-@app.route(route="attendance", methods=[func.HttpMethod.GET])
-def get_attendance(req: func.HttpRequest) -> func.HttpResponse:
-    logging.info('Processing attendance request.')
-
-    # Extract employee_id and date from the query parameters
-    employee_id = req.params.get('employee_id')
-    date = req.params.get('date')
-
-    if not employee_id or not date:
-        return func.HttpResponse(
-            body=json.dumps({'error': 'Both employee_id and date parameters are required'}),
-            status_code=400,
-            mimetype="application/json"
-        )
+@app.route(route="getattendance/all", methods=[func.HttpMethod.GET])
+def get_all_attendance(req: func.HttpRequest) -> func.HttpResponse:
+    logging.info('Processing request to get attendance records.')
 
     try:
-        # Construct the ID for the attendance record
-        attendance_id = f"attendance_{employee_id}_{date}"
-        
-        # Fetch the attendance record from the Cosmos DB
-        attendance_record = attendance_container.read_item(item=attendance_id, partition_key=attendance_id)
+        # Fetch optional parameters
+        date_param = req.params.get('date')
+        employee_id_param = req.params.get('employeeId')
 
-        # Return the attendance record
-        return func.HttpResponse(
-            body=json.dumps(attendance_record),
-            status_code=200,
-            mimetype="application/json"
-        )
+        # Ensure employeeId is stripped of any leading/trailing whitespace and cast to an integer if provided
+        if employee_id_param:
+            try:
+                employee_id_param = int(employee_id_param.strip())
+            except ValueError:
+                return func.HttpResponse(
+                    body=json.dumps({'error': 'Invalid employeeId. It should be an integer.'}),
+                    status_code=400,
+                    mimetype="application/json"
+                )
 
-    except exceptions.CosmosResourceNotFoundError:
-        return func.HttpResponse(
-            body=json.dumps({'error': f'No attendance record found for Employee ID {employee_id} on {date}'}),
-            status_code=404,
-            mimetype="application/json"
-        )
+        # Base query for all attendance records
+        query = "SELECT * FROM c WHERE STARTSWITH(c.id, 'attendance_')"
 
-    except exceptions.CosmosHttpResponseError as e:
-        logging.error(f"Failed to fetch attendance record: {str(e)}")
-        return func.HttpResponse(
-            body=json.dumps({'error': f'Failed to fetch attendance record: {e.message}'}),
-            status_code=500,
-            mimetype="application/json"
-        )
+        # Add filter for date if provided
+        if date_param:
+            query += f" AND c.date = '{date_param}'"
 
+        # Add filter for employeeId if provided
+        if employee_id_param:
+            query += f" AND c.employeeId = {employee_id_param}"
 
-                                         # 2.getall_attendance_by_date
-
-@app.function_name(name="get_all_attendance_by_date")
-@app.route(route="attendance/all", methods=[func.HttpMethod.GET])
-def get_all_attendance_by_date(req: func.HttpRequest) -> func.HttpResponse:
-    logging.info('Processing request to get all attendance records by date.')
-
-    # Extract date from the query parameters
-    date = req.params.get('date')
-
-    if not date:
-        return func.HttpResponse(
-            body=json.dumps({'error': 'Date parameter is required'}),
-            status_code=400,
-            mimetype="application/json"
-        )
-
-    try:
-        # Query to fetch all attendance records for the specific date
-        query = f"SELECT * FROM c WHERE STARTSWITH(c.id, 'attendance_') AND CONTAINS(c.Date, '{date}')"
+        # Execute query to fetch attendance records
         items = list(attendance_container.query_items(query=query, enable_cross_partition_query=True))
-        
+
         if items:
             return func.HttpResponse(
                 body=json.dumps(items),
                 status_code=200,
                 mimetype="application/json"
             )
-        
+
         return func.HttpResponse(
-            body=json.dumps({'message': f'No attendance records found for the date {date}'}),
+            body=json.dumps({'message': 'No attendance records found'}),
             status_code=404,
             mimetype="application/json"
         )
@@ -438,3 +411,6 @@ def get_all_attendance_by_date(req: func.HttpRequest) -> func.HttpResponse:
             status_code=500,
             mimetype="application/json"
         )
+
+
+
