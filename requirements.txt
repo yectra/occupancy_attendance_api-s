@@ -1,0 +1,18 @@
+# DO NOT include azure-functions-worker in this file
+# The Python Worker is managed by Azure Functions platform
+# Manually managing azure-functions-worker may cause unexpected issues
+
+azure-functions==1.13.3
+azure-cosmos==4.3.0
+azure-storage-blob==12.17.0
+scikit-learn==1.2.2
+natsort==8.4.0
+python-dotenv==1.0.0
+pydantic==1.10.4
+numpy==1.24.4
+opencv-python
+uuid==1.30
+onnxruntime
+
+
+
