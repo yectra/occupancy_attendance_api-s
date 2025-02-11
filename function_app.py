@@ -1,6 +1,5 @@
 import json
 import logging
-import azure.functions as func
 from natsort import natsorted
 from dotenv import load_dotenv
 from azure.cosmos import CosmosClient, exceptions 
@@ -12,11 +11,32 @@ from typing import List, Optional, Tuple, Literal
 import base64
 import numpy as np
 from datetime import datetime
+import requests
 import re
+import jwt
+from jwt import InvalidTokenError
+from azure.functions import HttpRequest, HttpResponse
+from jwt.algorithms import RSAAlgorithm
+from functools import wraps
+import logging
+import json
+import os
+import jwt
+from jwt.exceptions import InvalidTokenError
+import requests
+import azure.functions as func
+from typing import Dict, Any, Callable
+
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
 
 # Load environment variables from .env file
 load_dotenv()
+
+# Azure B2C configuration from .env
+AZURE_B2C_AUTHORITY = os.getenv("AZURE_B2C_AUTHORITY")
+AZURE_B2C_CLIENT_ID = os.getenv("AZURE_B2C_CLIENT_ID")
+B2C_ISSUER = os.getenv("B2C_ISSUER")
+B2C_OPENID_KEYS_ENDPOINT = os.getenv("B2C_OPENID_KEYS_ENDPOINT")
 
 # Azure Cosmos DB configuration
 COSMOS_CONNECTION_STRING = os.getenv('COSMOS_CONNECTION_STRING')
@@ -59,8 +79,116 @@ person_features =database.get_container_client(PERSON_FEATURE_CONTAINER)
 blob_service_client = BlobServiceClient.from_connection_string(BLOB_CONNECTION_STRING)
 blob_container_client = blob_service_client.get_container_client(BLOB_CONTAINER_NAME)
 
+for var in ["AZURE_B2C_AUTHORITY", "AZURE_B2C_CLIENT_ID", "B2C_OPENID_KEYS_ENDPOINT"]:
+    if not os.getenv(var):
+        raise EnvironmentError(f"Missing required environment variable: {var}")
+
 print('Successfully connected all the strings')
 
+
+def get_openid_config():
+    """Fetch OpenID configuration from Azure AD B2C"""
+    response = requests.get(B2C_OPENID_KEYS_ENDPOINT)
+    if response.status_code != 200:
+        raise Exception("Failed to retrieve OpenID Configuration")
+    return response.json()
+
+
+def get_signing_keys():
+    """Fetch signing keys from OpenID Connect endpoint"""
+    openid_config = get_openid_config()
+    jwks_uri = openid_config.get("jwks_uri")
+
+    response = requests.get(jwks_uri)
+    if response.status_code != 200:
+        raise Exception("Failed to retrieve JWT signing keys")
+
+    keys = response.json().get("keys", [])
+    key_dict = {key["kid"]: RSAAlgorithm.from_jwk(json.dumps(key)) for key in keys}
+    return key_dict
+
+def decode_jwt(token: str):
+    """Decode and validate JWT token"""
+    try:
+        key_dict = get_signing_keys()
+        headers = jwt.get_unverified_header(token)
+        kid = headers.get("kid")
+
+        if not kid or kid not in key_dict:
+            raise InvalidTokenError("No matching key found for token")
+
+        decoded_token = jwt.decode(
+            token,
+            key=key_dict[kid],
+            algorithms=["RS256"],
+            audience=AZURE_B2C_CLIENT_ID,
+            issuer=B2C_ISSUER
+        )
+
+        return decoded_token
+
+    except InvalidTokenError as e:
+        logging.error(f"Token validation error: {str(e)}")
+        raise
+
+
+def validate_and_decode_token(req: func.HttpRequest) -> Dict[str, Any]:
+    """Validates the JWT token from the request and decodes it.""" 
+    logging.info(f"Authorization header: {req.headers.get('Authorization')}")  # Log the header
+
+    # Extract token from header
+    auth_header = req.headers.get("Authorization")
+
+    if not auth_header:
+        logging.error("No Authorization header found")
+        raise ValueError("Authorization header is missing")
+    
+    # Validate Bearer token format
+    parts = auth_header.split()
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        logging.error(f"Invalid Authorization header format: {auth_header}")
+        raise ValueError("Invalid Authorization header format")
+    
+    token = parts[1]
+    # Decode and validate the token
+    try:
+        decoded_token = decode_jwt(token)
+        if not decoded_token.get('sub'):
+            raise ValueError("Token missing required 'sub' claim")
+        return decoded_token
+    except Exception as e:
+        logging.error(f"Token validation failed: {str(e)}")
+        raise
+
+
+
+def require_auth(func):
+    @wraps(func)
+    async def wrapper(req: HttpRequest) -> HttpResponse:
+        try:
+            # Validate and decode the token
+            decoded_token = validate_and_decode_token(req)
+            logging.info(f"Request is authorized. Token claims: {decoded_token}")
+            
+            # Attach user info to the request object
+            req.user_info = {
+                'user_id': decoded_token.get('sub'),
+                'email': decoded_token.get('emails', [None])[0],
+                'name': decoded_token.get('name'),
+                'token_claims': decoded_token
+            }
+            return await func(req)
+        
+        except Exception as e:
+            logging.error(f"Unauthorized Request: {e}")
+            return HttpResponse(
+                json.dumps({"error": "Unauthorized: Invalid or expired token"}), 
+                status_code=401,
+                mimetype="application/json"
+            )
+    return wrapper
+
+    
 class CameraDetail(BaseModel):
     entranceName: str
     cameraPosition: Literal["inside-out", "outside-in"]
@@ -72,6 +200,61 @@ class PageData(BaseModel):
     alertMessage: Literal["0-20", "20-40", "40-60", "60-80", "80-100"]
     documentId: str = None  # Optional for new entries
     cameraDetails: List[CameraDetail]  # Required field
+
+
+
+@app.function_name(name="get_employee")
+@app.route(route='employee/{employee_id}', methods=[func.HttpMethod.GET])
+@require_auth
+async def get_employee(req: func.HttpRequest) -> func.HttpResponse:
+    logging.info(f"Authorization Header: {req.headers.get('Authorization')}")  # Log authorization header
+
+    employee_id = req.route_params.get('employee_id')
+    if not employee_id:
+        logging.error("Employee ID missing in request.")
+        return func.HttpResponse(
+            json.dumps({"error": "Employee ID missing in request"}),
+            status_code=400,
+            mimetype="application/json"
+        )
+
+    try:
+        query = "SELECT * FROM c WHERE c.employeeId = @employee_id"
+        parameters = [{"name": "@employee_id", "value": str(employee_id)}]
+        items = list(employee_container.query_items(
+            query=query,
+            parameters=parameters,
+            enable_cross_partition_query=True
+        ))
+
+        if items:
+            logging.info(f"Employee found: {items[0]}")
+            return func.HttpResponse(
+                json.dumps(items[0]),
+                status_code=200,
+                mimetype="application/json"
+            )
+
+        logging.warning(f"No employee found with ID: {employee_id}")
+        return func.HttpResponse(
+            json.dumps({'message': 'Employee not found'}),
+            status_code=404,
+            mimetype="application/json"
+        )
+
+    except Exception as e:
+        logging.error(f"Error fetching employee with ID {employee_id}: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({'error': "Internal server error"}),
+            status_code=500,
+            mimetype="application/json"
+        )
+
+
+
+
+
+
 
 # for attendance
 # Pydantic model for camera details
@@ -87,105 +270,33 @@ class CameraUrls(BaseModel):
 
 
 
-                                # get employee by ID
+# Logs for the HTTP function route handling
 
-@app.function_name(name="get_employee")
-@app.route(route='employee/{employee_id}', methods=[func.HttpMethod.GET])
-def get_employee(req: func.HttpRequest) -> func.HttpResponse:
-    try:
-        # Extract employee_id from the route parameters
-        employee_id = req.route_params.get('employee_id')
 
-        # Convert employee_id to string (since it's stored as an string in the database)
-        employee_id = str(employee_id)
-
-        # Query to fetch employee record by employeeId
-        query = "SELECT * FROM c WHERE c.employeeId = @employee_id"
-        parameters = [{"name": "@employee_id", "value": employee_id}]
-        items = list(employee_container.query_items(
-            query=query, 
-            parameters=parameters, 
-            enable_cross_partition_query=True
-        ))
-
-        # Check if an employee record is found
-        if items:
-            return func.HttpResponse(
-                body=json.dumps(items[0]),  # Return the first matching employee
-                status_code=200,
-                mimetype="application/json"
-            )
-
-        # If no record is found, return a 404 response
-        return func.HttpResponse(
-            body=json.dumps({'message': 'Employee not found'}),
-            status_code=404,
-            mimetype="application/json"
-        )
-
-    except ValueError:
-        # If employee_id is not a valid String
-        logging.error("Invalid employee_id. It should be an String.")
-        return func.HttpResponse(
-            body=json.dumps({'error': 'Invalid employee ID. It should be an String.'}),
-            status_code=400,
-            mimetype="application/json"
-        )
-
-    except Exception as e:
-        logging.error(f"Error fetching employee: {str(e)}")
-        return func.HttpResponse(
-            body=json.dumps({'error': str(e)}),
-            status_code=500,
-            mimetype="application/json"
-        )
 
     
                                 # Fetch all employee records -getall
 @app.function_name(name="get_all_employees")
 @app.route(route='employees', methods=[func.HttpMethod.GET])
-def get_all_employees(req: func.HttpRequest) -> func.HttpResponse:
+@require_auth
+async def get_all_employees(req: func.HttpRequest) -> func.HttpResponse:
     try:
-        # Get pagination parameters from the query string, if they exist
-        page_number = req.params.get('page_number')
-        page_size = req.params.get('page_size')
-        
-        # Set default page_number and page_size if not provided
-        page_number = int(page_number) if page_number else 1
-        page_size = int(page_size) if page_size else 10
+        logging.info(f"Token validated for user: {req.user_info.get('email', 'unknown')}")
 
-        # Calculate offset
+        # Proceed with the rest of the logic
+        page_number = int(req.params.get('page_number', 1))
+        page_size = int(req.params.get('page_size', 10))
         offset = (page_number - 1) * page_size
 
-        # Base query (without sorting)
         query = "SELECT * FROM c"
-
-        # Fetch all employee records from the container
         all_items = list(employee_container.query_items(query=query, enable_cross_partition_query=True))
+        paginated_items = all_items[offset:offset + page_size]
 
-        # Sorting using Python's natural sorting (to handle alphanumeric employeeIds)
-       
-        sorted_items = natsorted(all_items, key=lambda x: x['employeeId'])
-
-        # Apply pagination to the sorted items
-        paginated_items = sorted_items[offset:offset + page_size]
-        logging.info(f"Paginated items count: {len(paginated_items)}")
-
-        # If no items found, return an empty response
-        if not paginated_items:
-            return func.HttpResponse(
-                body=json.dumps([]),
-                status_code=200,
-                mimetype="application/json"
-            )
-
-        # Return paginated results
         return func.HttpResponse(
             body=json.dumps(paginated_items),
             status_code=200,
             mimetype="application/json"
         )
-
     except Exception as e:
         logging.error(f"Error fetching employees: {str(e)}")
         return func.HttpResponse(
@@ -198,26 +309,30 @@ def get_all_employees(req: func.HttpRequest) -> func.HttpResponse:
 
 
 
+
                                            # Search bar Attendance
 
 @app.function_name(name="search_bar_attendance")
 @app.route(route='attendance/search', methods=[func.HttpMethod.GET])
-def search_attendance(req: func.HttpRequest) -> func.HttpResponse:
-    # Retrieve parameters using 'employeeId' and 'employeeName'
-    employee_id = req.params.get('employeeId')
-    employee_name = req.params.get('employeeName')
-    date = req.params.get('date')
-
-    # Ensure that at least one search parameter is provided
-    if not (employee_id or employee_name or date):
-        return func.HttpResponse(
-            body=json.dumps({'error': 'At least one search parameter (employeeId, employeeName, or date) is required'}),
-            status_code=400,
-            mimetype="application/json"
-        )
-
+@require_auth
+async def search_attendance(req: func.HttpRequest) -> func.HttpResponse:
     try:
-        # Build the query dynamically based on the provided parameters
+        logging.info(f"Token validated for user: {req.user_info.get('email', 'unknown')}")
+        
+        # Retrieve parameters
+        employee_id = req.params.get('employeeId')
+        employee_name = req.params.get('employeeName')
+        date = req.params.get('date')
+
+        logging.info(f"Search Parameters - employee_id: {employee_id}, employee_name: {employee_name}, date: {date}")
+
+        if not (employee_id or employee_name or date):
+            return func.HttpResponse(
+                body=json.dumps({'error': 'At least one search parameter (employeeId, employeeName, or date) is required'}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
         query_conditions = []
         parameters = []
 
@@ -226,7 +341,6 @@ def search_attendance(req: func.HttpRequest) -> func.HttpResponse:
             parameters.append({"name": "@employee_id", "value": int(employee_id)})
 
         if employee_name:
-            # Modify the condition to be case insensitive
             query_conditions.append("STARTSWITH(LOWER(c.employeeName), LOWER(@employee_name))")
             parameters.append({"name": "@employee_name", "value": employee_name.lower()})
 
@@ -234,10 +348,8 @@ def search_attendance(req: func.HttpRequest) -> func.HttpResponse:
             query_conditions.append("c.date = @date")
             parameters.append({"name": "@date", "value": date})
 
-        # Combine conditions with AND
         query = "SELECT * FROM c WHERE " + " AND ".join(query_conditions)
-
-        logging.info(f"Constructed query: {query}")  # Debugging line to ensure the query is constructed correctly
+        logging.info(f"Constructed query: {query}")
 
         items = list(attendance_container.query_items(query=query, parameters=parameters, enable_cross_partition_query=True))
 
@@ -269,6 +381,10 @@ def search_attendance(req: func.HttpRequest) -> func.HttpResponse:
 
 
                                             # post emp
+
+
+
+
 
 
 # Function to upload image to Azure Blob Storage
@@ -362,8 +478,11 @@ def delete_image_from_blob(blob_url):
 # Define the Azure Function for adding an employee      -post
 @app.function_name(name="add_employee")
 @app.route(route='employee', methods=[func.HttpMethod.POST])
-def add_employee(req: func.HttpRequest) -> func.HttpResponse:
+@require_auth
+async def add_employee(req: func.HttpRequest) -> func.HttpResponse:
     try:
+        logging.info(f"Token validated for user: {req.user_info.get('email', 'unknown')}")
+
         # Extract JSON data from the request body
         json_data = req.get_json()
 
@@ -391,7 +510,7 @@ def add_employee(req: func.HttpRequest) -> func.HttpResponse:
             )
 
         # Validate email format using regex
-        EMAIL_REGEX = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+        EMAIL_REGEX = r'^[a-zA-Z0-9._%+-]+@[a-zAZ0-9.-]+\.[a-zA-Z]{2,}$'
         if not re.match(EMAIL_REGEX, email):
             return func.HttpResponse(
                 body=json.dumps({'error': 'Invalid email format'}),
@@ -441,11 +560,14 @@ def add_employee(req: func.HttpRequest) -> func.HttpResponse:
             mimetype="application/json"
         )
 
-#                                                     # put function
+
+                                                    # put function
 # Update Employee function (for PUT requests)
 @app.function_name(name="update_employee")
 @app.route(route="update-employee/{employee_id}", methods=[func.HttpMethod.PUT])
-def update_employee(req: func.HttpRequest) -> func.HttpResponse:
+@require_auth
+async def update_employee(req: func.HttpRequest) -> func.HttpResponse:
+    logging.info(f"Token validated for user: {req.user_info.get('email', 'unknown')}")
     logging.info('Processing update employee request.')
 
     try:
@@ -562,21 +684,33 @@ def update_employee(req: func.HttpRequest) -> func.HttpResponse:
 @app.function_name(name="delete_employee")
 @app.route(route="employee/{employee_id}", methods=[func.HttpMethod.DELETE])
 def delete_employee(req: func.HttpRequest) -> func.HttpResponse:
+    # Validate and decode the token
+    try:
+        user_info = validate_and_decode_token(req)
+        logging.info(f"Token validated for user: {user_info.get('email', 'unknown')}")
+    except Exception as e:
+        logging.error(f"Unauthorized Request: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"error": "Unauthorized: Missing or Invalid Token"}),
+            status_code=401,
+            mimetype="application/json"
+        )
+
     logging.info('Processing delete employee request.')
 
     try:
         # Get the employee ID from the route parameters
         employee_id = req.route_params.get('employee_id')
-        
+
         # Query to fetch the employee record by id
         query = f"SELECT * FROM c WHERE c.employeeId = '{employee_id}'"
         logging.info(f"Query: {query}")
         items = list(employee_container.query_items(query=query, enable_cross_partition_query=True))
         logging.info(f"Items found: {items}")
-        
+
         if items:
             item = items[0]  # Get the first (and expected only) result
-            
+
             # Delete the employee record from Cosmos DB
             # Use the partition key and document id for deletion
             employee_container.delete_item(item=item['id'], partition_key=item['id'])
@@ -629,57 +763,77 @@ def fetch_employee_image(employee_id):
         logging.error(f"Error fetching employee image for {employee_id}: {str(e)}")
         return None
 
+
 @app.function_name(name="get_attendance_byfilter")
-@app.route(route="attendance/all", methods=[func.HttpMethod.GET])
-def get_all_attendance(req: func.HttpRequest) -> func.HttpResponse:
+@app.route(route="attendance/all", methods=['GET'])
+@require_auth
+async def get_all_attendance(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Retrieve attendance records with optional filtering and pagination
+    """
     logging.info('Processing request to get attendance records.')
 
     try:
+        # Extract query parameters
         date_param = req.params.get('date')
-        
-        # Validate the date format
+        employee_id_param = req.params.get('employeeId')
+        page_number = int(req.params.get('page_number', 1))
+        page_size = int(req.params.get('page_size', 10))
+
+        # Validate date parameter if provided
         if date_param:
             try:
                 input_date = datetime.strptime(date_param, '%Y-%m-%d').date()
                 if input_date > datetime.today().date():
                     return func.HttpResponse(
-                        body=json.dumps({'error': f'The date {date_param} is in the future. Please provide a valid date.'}),
+                        body=json.dumps({
+                            'error': f'The date {date_param} is in the future. Please provide a valid date.'
+                        }),
                         status_code=400,
                         mimetype="application/json"
                     )
             except ValueError:
                 return func.HttpResponse(
-                    body=json.dumps({'error': 'Invalid date format. Use YYYY-MM-DD.'}),
+                    body=json.dumps({
+                        'error': 'Invalid date format. Use YYYY-MM-DD.'
+                    }),
                     status_code=400,
                     mimetype="application/json"
                 )
         else:
             input_date = None
 
-        employee_id_param = req.params.get('employeeId')
-        page_number = int(req.params.get('page_number', 1))
-        page_size = int(req.params.get('page_size', 10))
-
+        # Calculate pagination offset
         offset = (page_number - 1) * page_size
 
-        # Base query to fetch attendance records
+        # Construct base query
         query = "SELECT * FROM c WHERE STARTSWITH(c.id, 'attendance_')"
 
+        # Add optional filters
+        query_params = []
         if input_date:
-            query += f" AND c.date = '{date_param}'"
+            query += " AND c.date = @date"
+            query_params.append({"name": "@date", "value": date_param})
+        
         if employee_id_param:
-            query += f" AND c.employeeId = '{employee_id_param}'"
+            query += " AND c.employeeId = @employee_id"
+            query_params.append({"name": "@employee_id", "value": employee_id_param})
 
+        # Add ordering and pagination
         query += " ORDER BY c.employeeId ASC"
         query += f" OFFSET {offset} LIMIT {page_size}"
 
         logging.info(f"Generated query: {query}")
 
-        # Fetch paginated attendance records from the container
-        paginated_items = list(attendance_container.query_items(query=query, enable_cross_partition_query=True))
+        # Execute query
+        paginated_items = list(attendance_container.query_items(
+            query=query, 
+            parameters=query_params,
+            enable_cross_partition_query=True
+        ))
         logging.info(f"Paginated items count: {len(paginated_items)}")
 
-        # If no items are found, return an appropriate message
+        # If no items found, return empty list
         if not paginated_items:
             return func.HttpResponse(
                 body=json.dumps([]),
@@ -687,13 +841,12 @@ def get_all_attendance(req: func.HttpRequest) -> func.HttpResponse:
                 mimetype="application/json"
             )
 
-        # Fetch image URLs for each attendance record
+        # Enrich items with employee image URLs
         for item in paginated_items:
             employee_id = item.get('employeeId')
-            # Fetch the employee image URL based on employeeId
             image_url = fetch_employee_image(employee_id)
             if image_url:
-                item['imageUrl'] = image_url  # Add the image URL to the attendance record
+                item['imageUrl'] = image_url
 
         # Return paginated attendance records
         return func.HttpResponse(
@@ -705,7 +858,18 @@ def get_all_attendance(req: func.HttpRequest) -> func.HttpResponse:
     except exceptions.CosmosHttpResponseError as e:
         logging.error(f"Failed to fetch attendance records: {str(e)}")
         return func.HttpResponse(
-            body=json.dumps({'error': f'Failed to fetch attendance records: {e.message}'}),
+            body=json.dumps({
+                'error': f'Failed to fetch attendance records: {str(e)}'
+            }),
+            status_code=500,
+            mimetype="application/json"
+        )
+    except Exception as e:
+        logging.error(f"Unexpected error in get_all_attendance: {str(e)}")
+        return func.HttpResponse(
+            body=json.dumps({
+                'error': 'An unexpected error occurred'
+            }),
             status_code=500,
             mimetype="application/json"
         )
@@ -725,34 +889,50 @@ def upsert_document(data: dict):
         logging.error(f"Error upserting document: {str(e)}")
         raise Exception("Failed to save data to the database.")
  
-# Azure function to save data(tracker)
+
+# Azure function to save data (tracker)
 @app.function_name(name="saveData")
 @app.route(route='api/saveData', methods=[func.HttpMethod.POST])
+@require_auth
 async def saveData(req: func.HttpRequest) -> func.HttpResponse:
+    # Validate and decode the token
+    try:
+        user_info = validate_and_decode_token(req)
+        logging.info(f"Token validated for user: {user_info.get('email', 'unknown')}")
+    except Exception as e:
+        logging.error(f"Unauthorized Request: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"error": "Unauthorized: Missing or Invalid Token"}),
+            status_code=401,
+            mimetype="application/json"
+        )
+
     try:
         # Parse the incoming JSON data
         req_body = req.get_json()
         data = PageData(**req_body)
-       
+
         if not data.cameraDetails:
             return func.HttpResponse(
                 json.dumps({"detail": "Camera details must be provided."}),
                 status_code=400
             )
- 
+
         if data.documentId:
             try:
+                # Read existing document from Cosmos DB
                 item = setup_container_name.read_item(item=data.documentId, partition_key=data.documentId)
                 item["capacityOfPeople"] = data.capacityOfPeople
                 item["alertMessage"] = data.alertMessage
                 item["cameraDetails"] = [camera.dict() for camera in data.cameraDetails]
- 
+
                 upsert_document(item)
                 return func.HttpResponse(
                     json.dumps({"message": "Data updated successfully."}),
                     status_code=200
                 )
             except exceptions.CosmosResourceNotFoundError:
+                # If document is not found, create a new one
                 documentId = str(uuid.uuid4())
                 document = {
                     "id": documentId,
@@ -779,6 +959,7 @@ async def saveData(req: func.HttpRequest) -> func.HttpResponse:
                     status_code=500
                 )
         else:
+            # Create new document when no documentId is provided
             documentId = str(uuid.uuid4())
             document = {
                 "id": documentId,
@@ -792,28 +973,42 @@ async def saveData(req: func.HttpRequest) -> func.HttpResponse:
                 json.dumps({"message": "Data saved successfully.", "documentId": documentId}),
                 status_code=201
             )
- 
+
     except Exception as e:
         logging.error(f"Error processing request: {str(e)}")
         return func.HttpResponse(
             json.dumps({"detail": "An error occurred during processing."}),
             status_code=500
         )
+
  
  
-# Azure function to get camera URLs(tracker)
+# Azure function to get camera URLs (tracker)
 @app.function_name(name="getCameraUrlsTracker")
 @app.route(route='api/getCameraUrls/{documentId}', methods=[func.HttpMethod.GET])
+@require_auth
 async def getCameraUrls(req: func.HttpRequest) -> func.HttpResponse:
+    # Validate and decode the token
+    try:
+        user_info = validate_and_decode_token(req)
+        logging.info(f"Token validated for user: {user_info.get('email', 'unknown')}")
+    except Exception as e:
+        logging.error(f"Unauthorized Request: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"error": "Unauthorized: Missing or Invalid Token"}),
+            status_code=401,
+            mimetype="application/json"
+        )
+
     # Retrieve the documentId from the URL path
     documentId = req.route_params.get("documentId")
- 
+
     try:
         # Fetch the document from Cosmos DB
         item = setup_container_name.read_item(item=documentId, partition_key=documentId)
         cameraDetails = item.get("cameraDetails", [])
         videoUrls = [camera["videoUrl"] for camera in cameraDetails]
-       
+
         return func.HttpResponse(
             json.dumps({"videoUrls": videoUrls}),
             status_code=200
@@ -835,21 +1030,32 @@ async def getCameraUrls(req: func.HttpRequest) -> func.HttpResponse:
             json.dumps({"detail": "An unexpected error occurred."}),
             status_code=500
         )
+
     
 
     # SEARCH API for Employee
 
 
 @app.function_name(name="search_employee")
-@app.route(route='employees/search', methods=[func.HttpMethod.GET])
-def search_employee(req: func.HttpRequest) -> func.HttpResponse:
-    # Retrieve the single search parameter
+@app.route(route='employees/search', methods=['GET'])
+@require_auth
+async def search_employee(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Search for employees by employeeId or name
+    
+    Query parameters:
+    - search: Search term (can be employeeId or partial name)
+    """
+    # Log incoming request parameters for debugging
     search = req.params.get('search')
+    logging.info(f"Received search parameter: {search}")
 
     # Ensure that the search parameter is provided
     if not search:
         return func.HttpResponse(
-            body=json.dumps({'error': 'A search parameter is required'}),
+            body=json.dumps({
+                'error': 'A search parameter is required'
+            }),
             status_code=400,
             mimetype="application/json"
         )
@@ -859,26 +1065,38 @@ def search_employee(req: func.HttpRequest) -> func.HttpResponse:
         query_conditions = []
         parameters = []
 
-        # Check if the search input is numeric (indicating employeeId)
+        # Determine search type and construct appropriate query
         if search.isnumeric():
-            # Use an exact match for employeeId
+            # Exact match for employeeId
             query_conditions.append("c.employeeId = @employee_id")
             parameters.append({"name": "@employee_id", "value": search})
         else:
-            # Use CONTAINS for partial matches in employeeName (case-insensitive)
-            query_conditions.append("CONTAINS(LOWER(c.employeeName), LOWER(@employee_name))")
-            parameters.append({"name": "@employee_name", "value": search.lower()})
+            # Partial match for employeeName (case-insensitive)
+            # Use multiple conditions to search across different name fields
+            name_search_conditions = [
+                "CONTAINS(LOWER(c.employeeName), LOWER(@employee_name))",
+                "CONTAINS(LOWER(c.firstName), LOWER(@employee_name))",
+                "CONTAINS(LOWER(c.lastName), LOWER(@employee_name))"
+            ]
+            
+            # Combine name search conditions
+            query_conditions.append(f"({' OR '.join(name_search_conditions)})")
+            parameters.append({"name": "@employee_name", "value": search.strip().lower()})
 
-        # Combine conditions with OR for flexibility
+        # Construct the full query with selected fields
         query = "SELECT c.employeeId, c.employeeName, c.role, c.email, c.dateOfJoining, c.imageUrl FROM c WHERE " + " OR ".join(query_conditions)
 
-        logging.info(f"Constructed query: {query}")  # Debugging line to ensure the query is constructed correctly
+        logging.info(f"Constructed query: {query}")
 
         # Perform the query to Cosmos DB
-        items = list(employee_container.query_items(query=query, parameters=parameters, enable_cross_partition_query=True))
+        items = list(employee_container.query_items(
+            query=query, 
+            parameters=parameters, 
+            enable_cross_partition_query=True
+        ))
 
+        # Handle query results
         if items:
-            # If there are results, return them
             return func.HttpResponse(
                 body=json.dumps(items),
                 status_code=200,
@@ -887,15 +1105,30 @@ def search_employee(req: func.HttpRequest) -> func.HttpResponse:
 
         # If no items found, return a 404 response
         return func.HttpResponse(
-            body=json.dumps({'message': 'Employee not found'}),
+            body=json.dumps({
+                'message': 'No employees found matching the search criteria'
+            }),
             status_code=404,
             mimetype="application/json"
         )
 
     except exceptions.CosmosHttpResponseError as e:
+        # Handle Cosmos DB specific errors
         logging.error(f"Failed to search employee records: {str(e)}")
         return func.HttpResponse(
-            body=json.dumps({'error': f'Failed to search employee records: {e.message}'}),
+            body=json.dumps({
+                'error': f'Failed to search employee records: {str(e)}'
+            }),
+            status_code=500,
+            mimetype="application/json"
+        )
+    except Exception as e:
+        # Catch any unexpected errors
+        logging.error(f"Unexpected error in search_employee: {str(e)}")
+        return func.HttpResponse(
+            body=json.dumps({
+                'error': 'An unexpected error occurred during employee search'
+            }),
             status_code=500,
             mimetype="application/json"
         )
@@ -920,16 +1153,17 @@ def get_camera_data_by_id(camera_id: str):
         logging.error(f"Error retrieving camera data: {str(e)}")
         return None
 
+# attendance camera
 @app.function_name(name="saveattendanceCameraUrl")
 @app.route(route='api/cameraUrl', methods=[func.HttpMethod.POST])
+@require_auth
 async def saveCameraUrls(req: func.HttpRequest) -> func.HttpResponse:
     try:
+        logging.info(f"Token validated for user: {req.user_info.get('email', 'unknown')}")
+
         # Parse the incoming JSON data
         req_body = req.get_json()
         
-        # Auto-generate a new unique id
-        camera_id = str(uuid.uuid4())
-
         # Extract and validate `cameraDetails1`
         camera_details = req_body.get("cameraDetails1", [])
         if not camera_details or not isinstance(camera_details, list):
@@ -945,8 +1179,7 @@ async def saveCameraUrls(req: func.HttpRequest) -> func.HttpResponse:
                     json.dumps({"detail": "Each item in 'cameraDetails1' must contain 'email', 'cameraI', 'punchinUrl', 'cameraII', and 'punchoutUrl'."}),
                     status_code=400
                 )
-            
-            # Filter and store only the required keys
+
             validated_camera_details.append({
                 "email": detail["email"],
                 "cameraI": detail["cameraI"],
@@ -955,19 +1188,27 @@ async def saveCameraUrls(req: func.HttpRequest) -> func.HttpResponse:
                 "punchoutUrl": detail["punchoutUrl"]
             })
 
-        # Create camera data with auto-generated id
-        camera_data = {
-            "id": camera_id,
-            "cameraDetails1": validated_camera_details
-        }
+        # Fetch existing record by email
+        email = validated_camera_details[0]["email"]  # Assuming each request contains a single unique email
+        existing_record = get_camera_record_by_email(email)  # Function to fetch record from Cosmos DB
 
-        # Upsert the camera URLs into Cosmos DB
-        upsert_camera_urls(camera_data)
+        if existing_record:
+            # Update the existing record
+            existing_record["cameraDetails1"] = validated_camera_details
+            upsert_camera_urls(existing_record)  # Update record in Cosmos DB
+            response_message = {"message": "Camera URLs updated successfully.", "id": existing_record["id"]}
+        else:
+            # Insert new record with a generated UUID
+            camera_id = str(uuid.uuid4())
+            camera_data = {
+                "id": camera_id,
+                "cameraDetails1": validated_camera_details
+            }
+            upsert_camera_urls(camera_data)  # Insert new record into Cosmos DB
+            response_message = {"message": "Camera URLs saved successfully.", "id": camera_id}
 
-        return func.HttpResponse(
-            json.dumps({"message": "Camera URLs saved successfully.", "id": camera_id}),
-            status_code=201
-        )
+        return func.HttpResponse(json.dumps(response_message), status_code=200)
+
     except Exception as e:
         logging.error(f"Error processing request: {str(e)}")
         return func.HttpResponse(
@@ -976,6 +1217,10 @@ async def saveCameraUrls(req: func.HttpRequest) -> func.HttpResponse:
         )
 
 
+def get_camera_record_by_email(email: str):
+    query = f"SELECT * FROM c WHERE ARRAY_CONTAINS(c.cameraDetails1, {{'email': '{email}'}}, true)"
+    items = list(camera_urls_container.query_items(query=query, enable_cross_partition_query=True))
+    return items[0] if items else None
 
 def upsert_camera_urls(camera_data):
     # Assuming camera_urls_container is your Cosmos DB container
@@ -985,7 +1230,20 @@ def upsert_camera_urls(camera_data):
 # put method to update cameraurl -attendance
 @app.function_name(name="updateCameraUrl")
 @app.route(route='api/cameraUrl', methods=[func.HttpMethod.PUT])
+@require_auth
 async def updateCameraUrls(req: func.HttpRequest) -> func.HttpResponse:
+    # Validate and decode the token
+    try:
+        user_info = validate_and_decode_token(req)
+        logging.info(f"Token validated for user: {user_info.get('email', 'unknown')}")
+    except Exception as e:
+        logging.error(f"Unauthorized Request: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"error": "Unauthorized: Missing or Invalid Token"}),
+            status_code=401,
+            mimetype="application/json"
+        )
+
     try:
         # Parse the incoming JSON data
         req_body = req.get_json()
@@ -1039,11 +1297,14 @@ async def updateCameraUrls(req: func.HttpRequest) -> func.HttpResponse:
             status_code=500
         )
 
-
 # GET method to retrieve camera URL by ID -attendance
 @app.function_name(name="attendanceGetCameraUrlById")
 @app.route(route='api/cameraUrl', methods=[func.HttpMethod.GET])
+@require_auth
 async def getCameraUrlById(req: func.HttpRequest) -> func.HttpResponse:
+    # Log the validated user's email
+    logging.info(f"Token validated for user: {req.user_info.get('email', 'unknown')}")
+
     try:
         # Extract 'id' from query parameters
         camera_id = req.params.get("id")
@@ -1087,7 +1348,10 @@ def get_camera_by_id(camera_id):
 # Define the Azure Function for adding an organization - POST
 @app.function_name(name="add_organization")
 @app.route(route="organization", methods=[func.HttpMethod.POST])
-def add_organization(req: func.HttpRequest) -> func.HttpResponse:
+@require_auth
+async def add_organization(req: func.HttpRequest) -> func.HttpResponse:
+    logging.info(f"Token validated for user: {req.user_info.get('email', 'unknown')}")
+
     try:
         # Extract JSON data from the request body
         json_data = req.get_json()
@@ -1158,42 +1422,62 @@ def add_organization(req: func.HttpRequest) -> func.HttpResponse:
             mimetype="application/json"
         )
 
-
-@app.function_name(name="getAllPersons")
-@app.route(route='api/getAllPersons', methods=[func.HttpMethod.GET])
-async def getAllPersons(req: func.HttpRequest) -> func.HttpResponse:
+@app.function_name(name="getPersonCountOverTime")
+@app.route(route='api/getPersonCountOverTime', methods=[func.HttpMethod.GET])
+async def get_person_count_over_time(req: func.HttpRequest) -> func.HttpResponse:
+    # Validate and decode the token
     try:
+        user_info = validate_and_decode_token(req)
+        logging.info(f"Token validated for user: {user_info.get('email', 'unknown')}")
+    except Exception as e:
+        logging.error(f"Unauthorized Request: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"error": "Unauthorized: Missing or Invalid Token"}),
+            status_code=401,
+            mimetype="application/json"
+        )
+
+    try:
+        # Query to fetch all records with a non-null person_id
         query = """
-        SELECT VALUE {
-            'person_id': c.person_id,
-            'camera_id': c.camera_id,
-            'timestamp': c.timestamp,
-            'last_updated': c.last_updated
-        }
+        SELECT c.person_id, c.timestamp
         FROM c
         WHERE NOT IS_NULL(c.person_id)
         """
-        items = person_features.query_items(query=query, enable_cross_partition_query=True)
         
-        persons = [
-            {
-                "person_id": item["person_id"],
-                "camera_id": item["camera_id"],
-                "timestamp": item["timestamp"],
-                "last_updated": item["last_updated"]
-            }
-            for item in items
+        # Fetch all items from the query
+        items = list(person_features.query_items(query=query, enable_cross_partition_query=True))
+        
+        # Aggregation logic: Count persons by hour
+        from collections import defaultdict
+        import datetime
+
+        person_count_by_hour = defaultdict(set)  # Use a set to ensure unique person_id counts
+
+        for item in items:
+            timestamp = item.get("timestamp")
+            person_id = item.get("person_id")
+
+            # Parse timestamp and extract the hour (e.g., "2024-12-23T04")
+            hour_key = datetime.datetime.fromisoformat(timestamp).strftime("%Y-%m-%dT%H")
+            person_count_by_hour[hour_key].add(person_id)
+
+        # Prepare the final data: Count unique person_id per hour
+        time_series_data = [
+            {"time_interval": time_interval, "person_count": len(person_ids)}
+            for time_interval, person_ids in sorted(person_count_by_hour.items())
         ]
 
         return func.HttpResponse(
-            json.dumps({"persons": persons}),
+            json.dumps({"data": time_series_data}),
             status_code=200,
             mimetype="application/json"
         )
+
     except exceptions.CosmosHttpResponseError as e:
-        logging.error(f"Failed to retrieve all persons: {str(e)}")
+        logging.error(f"Failed to retrieve person count over time: {str(e)}")
         return func.HttpResponse(
-            json.dumps({"detail": "Failed to retrieve all persons."}),
+            json.dumps({"detail": "Failed to retrieve person count over time."}),
             status_code=500
         )
     except Exception as e:
@@ -1204,22 +1488,55 @@ async def getAllPersons(req: func.HttpRequest) -> func.HttpResponse:
         )
 
 
+     
 @app.function_name(name="getAllCounts")
 @app.route(route='api/getAllCounts', methods=[func.HttpMethod.GET])
 async def getAllCounts(req: func.HttpRequest) -> func.HttpResponse:
+    # Validate and decode the token
+    try:
+        user_info = validate_and_decode_token(req)
+        logging.info(f"Token validated for user: {user_info.get('email', 'unknown')}")
+    except Exception as e:
+        logging.error(f"Unauthorized Request: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"error": "Unauthorized: Missing or Invalid Token"}),
+            status_code=401,
+            mimetype="application/json"
+        )
+
     try:
         query = "SELECT * FROM c"
         items = counts_container.query_items(query=query, enable_cross_partition_query=True)
-        counts = {
-            str(item["camera_id"]): {
-                "entry": int(item.get("entry", 0)),
-                "exit": int(item.get("exit", 0))
+       
+        counts = {}
+        total_entry = 0
+        total_exit = 0
+ 
+        for item in items:
+            camera_id = str(item["camera_id"])
+            entry_count = int(item.get("entry", 0))
+            exit_count = int(item.get("exit", 0))
+ 
+            # Update per-camera counts
+            counts[camera_id] = {
+                "entry": entry_count,
+                "exit": exit_count
             }
-            for item in items
+ 
+            # Update total counts
+            total_entry += entry_count
+            total_exit += exit_count
+ 
+        response_data = {
+            "counts": counts,
+            "total": {
+                "entry": total_entry,
+                "exit": total_exit
+            }
         }
-
+ 
         return func.HttpResponse(
-            json.dumps({"counts": counts}),
+            json.dumps(response_data),
             status_code=200,
             mimetype="application/json"
         )
@@ -1235,285 +1552,5 @@ async def getAllCounts(req: func.HttpRequest) -> func.HttpResponse:
             json.dumps({"detail": "An unexpected error occurred."}),
             status_code=500
         )
-    
 
-
-
-
-
-
-
-# # image validation
-
-# import base64
-# import uuid
-# import logging
-# import json
-# import re
-# import cv2
-# import requests
-# import numpy as np
-# from insightface.app import FaceAnalysis
-# from sklearn.metrics.pairwise import cosine_similarity
-# import azure.functions as func
-
-# # Assuming EmployeeRepository class is already defined
-# class EmployeeRepository:
-#     def __init__(self, container):
-#         self.container = container
-#         self.employees = {}
-#         self.employee_embeddings = {}
-
-#     def fetch_employees(self, face_recognizer):
-#         try:
-#             employees = list(self.container.read_all_items())
-#             logging.info(f"Fetched {len(employees)} employees.")
-
-#             for employee in employees:
-#                 name = employee['employeeName']
-#                 image_url = employee['imageUrl']
-
-#                 # Download and process image
-#                 img = self._download_image(image_url)
-#                 if img is not None:
-#                     self.employees[name] = img
-
-#                     # Extract face embedding
-#                     try:
-#                         faces = face_recognizer.get(img)
-#                         if faces:
-#                             self.employee_embeddings[name] = self._normalize_embedding(faces[0]['embedding'])
-#                         else:
-#                             logging.warning(f"No face detected for {name}")
-#                     except Exception as e:
-#                         logging.error(f"Error processing embedding for {name}: {e}")
-#         except Exception as e:
-#             logging.error(f"Failed to fetch employees: {e}")
-
-#     def _download_image(self, url):
-#         try:
-#             logging.info(f"Downloading image from URL: {url}")
-#             response = requests.get(url, timeout=5)
-#             response.raise_for_status()
-#             img_array = np.asarray(bytearray(response.content), dtype=np.uint8)
-#             img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-#             if img is None:
-#                 raise ValueError("Unable to decode the downloaded image.")
-#             return img
-#         except Exception as e:
-#             logging.error(f"Error downloading or decoding image from {url}: {e}")
-#             return None
-
-#     def _normalize_embedding(self, embedding):
-#         return embedding / np.linalg.norm(embedding)
-
-#     def get_known_faces(self):
-#         return self.employees, self.employee_embeddings
-
-
-# # Function to upload an image to Azure Blob Storage
-# def upload_image_to_blob1(base64_image, employee_id):
-#     try:
-#         # Decode the image
-#         image_bytes = base64.b64decode(base64_image)
-#         file_name = f"{employee_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}.jpg"
-
-#         # Get BlobServiceClient
-#         blob_service_client = BlobServiceClient.from_connection_string(BLOB_CONNECTION_STRING)
-
-#         # Get container client
-#         container_client = blob_service_client.get_container_client(STORAGE_CONTAINER_NAME)
-
-#         # Verify container exists, or create it
-#         if not container_client.exists():
-#             logging.warning(f"Container '{STORAGE_CONTAINER_NAME}' not found. Creating it...")
-#             container_client.create_container()
-
-#         # Upload the file
-#         blob_client = container_client.get_blob_client(file_name)
-#         blob_client.upload_blob(image_bytes, overwrite=True)
-
-#         # Construct and return the image URL
-#         image_url = f"https://{STORAGE_ACCOUNT_NAME}.blob.core.windows.net/{STORAGE_CONTAINER_NAME}/{file_name}"
-#         return image_url
-
-#     except Exception as e:
-#         logging.error(f"Error uploading image to Blob: {e}")
-#         return None
-
-
-# # Updated Add Employee Function
-# @app.function_name(name="add_employee")
-# @app.route(route='employee', methods=[func.HttpMethod.POST])
-# def add_employee(req: func.HttpRequest) -> func.HttpResponse:
-#     try:
-#         # Extract JSON data from the request body
-#         json_data = req.get_json()
-
-#         if not json_data:
-#             return func.HttpResponse(
-#                 body=json.dumps({'error': 'JSON data is required in the request body'}),
-#                 status_code=400,
-#                 mimetype="application/json"
-#             )
-
-#         # Extract fields from the JSON data
-#         employee_id = json_data.get('employeeId')
-#         role = json_data.get('role')
-#         email = json_data.get('email')
-#         base64_image = json_data.get('imageBase64')  # Base64-encoded image
-#         date_of_joining = json_data.get('dateOfJoining')
-
-#         if not base64_image:
-#             return func.HttpResponse(
-#                 body=json.dumps({'error': 'ImageBase64 is required in the request'}),
-#                 status_code=400,
-#                 mimetype="application/json"
-#             )
-
-#         # Decode the base64 string into an image
-#         try:
-#             image_bytes = base64.b64decode(base64_image)
-#             img_array = np.frombuffer(image_bytes, np.uint8)
-#             img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-
-#             if img is None:
-#                 raise ValueError("Decoded image is None. Invalid or corrupted image data.")
-
-#         except Exception as e:
-#             logging.error(f"Error decoding image: {e}")
-#             return func.HttpResponse(
-#                 body=json.dumps({'error': 'Invalid image data'}),
-#                 status_code=400,
-#                 mimetype="application/json"
-#             )
-
-#         # Initialize the FaceAnalysis object
-#         face_recognizer = FaceAnalysis()
-#         face_recognizer.prepare(ctx_id=0)
-
-#         # Fetch all employees to detect duplicate faces
-#         employee_repository = EmployeeRepository(employee_container)
-#         employee_repository.fetch_employees(face_recognizer)
-#         _, known_embeddings = employee_repository.get_known_faces()
-
-#         # Detect faces in the new image
-#         new_faces = face_recognizer.get(img)
-#         if not new_faces:
-#             return func.HttpResponse(
-#                 body=json.dumps({'error': 'No face detected in the image'}),
-#                 status_code=400,
-#                 mimetype="application/json"
-#             )
-
-#         # Normalize the new face embedding
-#         new_embedding = new_faces[0]['embedding'] / np.linalg.norm(new_faces[0]['embedding'])
-
-#         # Compare with existing embeddings to check for duplicates
-#         for name, existing_embedding in known_embeddings.items():
-#             similarity = cosine_similarity([new_embedding], [existing_embedding])[0][0]
-#             if similarity > 0.7:
-#                 return func.HttpResponse(
-#                     body=json.dumps({'warn': f'Employee image already exists for {name}'}),
-#                     status_code=409,
-#                     mimetype="application/json"
-#                 )
-
-#         # Upload the image to Blob Storage
-#         image_url = upload_image_to_blob1(base64_image, employee_id)
-#         if not image_url:
-#             return func.HttpResponse(
-#                 body=json.dumps({'error': 'Image upload failed. Please try again.'}),
-#                 status_code=500,
-#                 mimetype="application/json"
-#             )
-
-#         # Create and store employee record
-#         employee_record = {
-#             'id': str(uuid.uuid4()),
-#             'employeeId': employee_id,
-#             'role': role,
-#             'email': email,
-#             'imageUrl': image_url,
-#             'dateOfJoining': date_of_joining,
-#         }
-
-#         employee_container.create_item(body=employee_record)
-
-#         return func.HttpResponse(
-#             body=json.dumps({'message': 'Employee added successfully', 'data': employee_record}),
-#             status_code=201,
-#             mimetype="application/json"
-#         )
-
-#     except Exception as e:
-#         logging.error(f"Error adding employee: {str(e)}")
-#         return func.HttpResponse(
-#             body=json.dumps({'error': str(e)}),
-#             status_code=500,
-#             mimetype="application/json"
-#         )
-
-
-
-# import azure.functions as func
-# import json
-# import logging
-# import uuid
-# import re
-# from deepface import DeepFace
-# import numpy as np
-# import cv2
-# import base64
-# import io
-# from PIL import Image
-
-# def convert_base64_to_image(base64_string):
-#     """Convert base64 string to image array"""
-#     img_data = base64.b64decode(base64_string)
-#     img = Image.open(io.BytesIO(img_data))
-#     return np.array(img)
-
-# def check_face_exists(new_face_image, container):
-#     """
-#     Check if the face already exists in the database
-#     Returns: (bool, str) - (exists, matching_employee_name)
-#     """
-#     try:
-#         # Convert new face image from base64 to array
-#         new_face_array = convert_base64_to_image(new_face_image)
-        
-#         # Query all employees with images
-#         query = "SELECT c.imageBase64, c.employeeName FROM c WHERE c.imageBase64 != null"
-#         existing_employees = list(container.query_items(
-#             query=query,
-#             enable_cross_partition_query=True
-#         ))
-        
-#         # Compare with each existing face
-#         for employee in existing_employees:
-#             try:
-#                 existing_face_array = convert_base64_to_image(employee['imageBase64'])
-                
-#                 # Use DeepFace to verify faces
-#                 result = DeepFace.verify(
-#                     img1_path=new_face_array,
-#                     img2_path=existing_face_array,
-#                     enforce_detection=False,
-#                     model_name="VGG-Face"
-#                 )
-                
-#                 # If verified with high confidence
-#                 if result["verified"] and result["distance"] < 0.4:  # Adjust threshold as needed
-#                     return True, employee['employeeName']
-                    
-#             except Exception as e:
-#                 logging.warning(f"Error comparing with one face: {str(e)}")
-#                 continue
-                
-#         return False, None
-        
-#     except Exception as e:
-#         logging.error(f"Error in face comparison: {str(e)}")
-#         raise
 
