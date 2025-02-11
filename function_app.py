@@ -200,9 +200,9 @@ class PageData(BaseModel):
     alertMessage: Literal["0-20", "20-40", "40-60", "60-80", "80-100"]
     documentId: str = None  # Optional for new entries
     cameraDetails: List[CameraDetail]  # Required field
+ 
 
-
-
+# get employee
 @app.function_name(name="get_employee")
 @app.route(route='employee/{employee_id}', methods=[func.HttpMethod.GET])
 @require_auth
