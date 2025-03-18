@@ -5,8 +5,12 @@ python-dotenv==1.0.0
 requests==2.31.0
 PyJWT==2.8.0
 natsort==8.4.0
-pydantic==1.10.13
+pydantic==1.8.2
 numpy==1.26.3
+pendulum==2.1.2
+azure-identity==1.15.0
+
+
 
 # DO NOT include azure-functions-worker in this file
 # The Python Worker is managed by Azure Functions platform

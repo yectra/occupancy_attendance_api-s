@@ -11,11 +11,12 @@ from pydantic import BaseModel
 from typing import List, Optional, Tuple, Literal
 import base64
 import numpy as np
-from datetime import datetime
+import pendulum
+import datetime
+from datetime import datetime,date
 import requests
 import re
 from datetime import timedelta
-import datetime
 import jwt
 from jwt import InvalidTokenError
 from azure.functions import HttpRequest, HttpResponse
@@ -31,6 +32,10 @@ import azure.functions as func
 from typing import Dict, Any, Callable
 from collections import defaultdict
 from urllib.parse import quote
+from azure.identity import ClientSecretCredential
+from azure.core.exceptions import HttpResponseError
+import urllib.parse
+
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
 
 # Load environment variables from .env file
@@ -49,7 +54,6 @@ EMPLOYEE_CONTAINER_NAME = os.getenv('EMPLOYEE_CONTAINER_NAME')
 ATTENDANCE_CONTAINER_NAME = os.getenv('ATTENDANCE_CONTAINER_NAME')
 ORGANIZATION_CONTAINER_NAME = os.getenv('ORGANIZATION_CONTAINER_NAME')
 SETUP_CONTAINER_NAME = os.getenv('SETUP_CONTAINER_NAME')
-
 CAMERA_URLS_CONTAINER_NAME = os.getenv('CAMERA_URLS_CONTAINER_NAME')
 
 # Azure Blob Storage configuration
@@ -65,8 +69,11 @@ PERSON_FEATURE_CONTAINER=os.getenv('PERSON_FEATURE_CONTAINER')
 TENANT_NAME = os.getenv('AZURE_B2C_TENANT_NAME')
 POLICY_NAME = os.getenv('AZURE_B2C_POLICY_NAME')
 CLIENT_ID = os.getenv('AZURE_B2C_CLIENT_ID')
-
-
+TENANT_ID = os.getenv("AZURE_B2C_TENANT_ID")
+CLIENT_ID = os.getenv("AZURE_B2C_CLIENT_ID")
+CLIENT_SECRET = os.getenv("AZURE_B2C_CLIENT_SECRET")
+USER_COUNTS=os.getenv('USER_COUNTS')
+USER_LOGS=os.getenv('USER_LOGS')
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)  # Set the logging level to DEBUG
 
@@ -85,7 +92,8 @@ setup_container = database.get_container_client(SETUP_CONTAINER_NAME)
 setup_container_name = database.get_container_client(SETUP_CONTAINER_NAME)
 counts_container = database.get_container_client(COUNTS_CONTAINER)
 person_features =database.get_container_client(PERSON_FEATURE_CONTAINER)
-
+user_counts_container = database.get_container_client(USER_COUNTS)
+user_logs_container = database.get_container_client(USER_LOGS)
 # Initialize the Blob Service Client
 blob_service_client = BlobServiceClient.from_connection_string(BLOB_CONNECTION_STRING)
 blob_container_client = blob_service_client.get_container_client(BLOB_CONTAINER_NAME)
@@ -119,7 +127,7 @@ def get_signing_keys():
     return key_dict
 
 def decode_jwt(token: str):
-    """Decode and validate JWT token"""
+    """Decode and validate JWT token, and determine if the user is Admin or Employee."""
     try:
         key_dict = get_signing_keys()
         headers = jwt.get_unverified_header(token)
@@ -127,7 +135,9 @@ def decode_jwt(token: str):
 
         if not kid or kid not in key_dict:
             raise InvalidTokenError("No matching key found for token")
+        logging.info(f"Expected Issuer: {B2C_ISSUER}")
 
+        # Decode token
         decoded_token = jwt.decode(
             token,
             key=key_dict[kid],
@@ -136,11 +146,17 @@ def decode_jwt(token: str):
             issuer=B2C_ISSUER
         )
 
+        # Log the expected vs actual issuer
+        logging.info(f"Expected Issuer: {B2C_ISSUER}")
+        logging.info(f"Actual Issuer in Token: {decoded_token.get('iss')}")
+
         return decoded_token
 
     except InvalidTokenError as e:
         logging.error(f"Token validation error: {str(e)}")
         raise
+
+
 
 
 def validate_and_decode_token(req: func.HttpRequest) -> Dict[str, Any]:
@@ -187,6 +203,7 @@ def require_auth(func):
                 'email': decoded_token.get('emails', [None])[0],
                 'name': decoded_token.get('name'),
                 'sub': decoded_token.get('sub'),
+                'jobTitle': decoded_token.get('jobTitle'), 
                 'token_claims': decoded_token
             }
             return await func(req)
@@ -213,6 +230,7 @@ class PageData(BaseModel):
     documentId: str = None  # Optional for new entries
     cameraDetails: List[CameraDetail]  # Required field
  
+
 
 # get employee
 @app.function_name(name="get_employee")
@@ -330,13 +348,32 @@ async def get_all_employees(req: func.HttpRequest) -> func.HttpResponse:
 async def search_attendance(req: func.HttpRequest) -> func.HttpResponse:
     try:
         logging.info(f"Token validated for user: {req.user_info.get('email', 'unknown')}")
-        
-        # Retrieve parameters
+
+        # Retrieve query parameters
         employee_id = req.params.get('employeeId')
         employee_name = req.params.get('employeeName')
         date = req.params.get('date')
+        page_number = req.params.get('page_number', 1)
+        page_size = req.params.get('page_size', 10)
 
-        logging.info(f"Search Parameters - employee_id: {employee_id}, employee_name: {employee_name}, date: {date}")
+        logging.info(f"Search Parameters - employee_id: {employee_id}, employee_name: {employee_name}, date: {date}, page_number: {page_number}, page_size: {page_size}")
+
+        # Validate pagination parameters
+        try:
+            page_number = int(page_number)
+            page_size = int(page_size)
+            if page_number < 1 or page_size < 1:
+                return func.HttpResponse(
+                    body=json.dumps({'error': 'page_number and page_size must be positive integers'}),
+                    status_code=400,
+                    mimetype="application/json"
+                )
+        except ValueError:
+            return func.HttpResponse(
+                body=json.dumps({'error': 'Invalid page_number or page_size. They must be integers.'}),
+                status_code=400,
+                mimetype="application/json"
+            )
 
         if not (employee_id or employee_name or date):
             return func.HttpResponse(
@@ -345,6 +382,7 @@ async def search_attendance(req: func.HttpRequest) -> func.HttpResponse:
                 mimetype="application/json"
             )
 
+        # Construct query conditions
         query_conditions = []
         parameters = []
 
@@ -360,9 +398,14 @@ async def search_attendance(req: func.HttpRequest) -> func.HttpResponse:
             query_conditions.append("c.date = @date")
             parameters.append({"name": "@date", "value": date})
 
+        # Construct the query with pagination
         query = "SELECT * FROM c WHERE " + " AND ".join(query_conditions)
+        query += " ORDER BY c.employeeId ASC"
+        query += f" OFFSET {(page_number - 1) * page_size} LIMIT {page_size}"
+
         logging.info(f"Constructed query: {query}")
 
+        # Execute query
         items = list(attendance_container.query_items(query=query, parameters=parameters, enable_cross_partition_query=True))
 
         if items:
@@ -487,7 +530,7 @@ def delete_image_from_blob(blob_url):
 
 
 
-# Define the Azure Function for adding an employee      -post
+# # Define the Azure Function for adding an employee      -post
 @app.function_name(name="add_employee")
 @app.route(route='employee', methods=[func.HttpMethod.POST])
 @require_auth
@@ -512,10 +555,10 @@ async def add_employee(req: func.HttpRequest) -> func.HttpResponse:
         role = json_data.get('role')
         email = json_data.get('email')
         base64_image = json_data.get('imageBase64')  # Base64-encoded image
-        date_of_joining = json_data.get('dateOfJoining')  # New field
+    
 
         # Check if required fields are provided
-        if not employee_id or not name or not role or not email or not date_of_joining:
+        if not employee_id or not name or not role or not email:
             return func.HttpResponse(
                 body=json.dumps({'error': 'All fields except image are required'}),
                 status_code=400,
@@ -563,7 +606,6 @@ async def add_employee(req: func.HttpRequest) -> func.HttpResponse:
             'role': role,
             'email': email,
             'imageUrl': image_url,
-            'dateOfJoining': date_of_joining,  # Add dateOfJoining field
             'organizationId': organization_id  # Map employee to the organization
         }
 
@@ -600,7 +642,7 @@ async def update_employee(req: func.HttpRequest) -> func.HttpResponse:
         employee_id = str(req.route_params.get('employee_id'))
         if not employee_id:
             return func.HttpResponse(
-                json.dumps({'error': 'Employee ID is required'}), 
+                json.dumps({'warn': 'Employee ID is required'}), 
                 status_code=400, 
                 mimetype="application/json"
             )
@@ -636,8 +678,8 @@ async def update_employee(req: func.HttpRequest) -> func.HttpResponse:
         item = items[0]  # Existing employee record
 
         # Handle image upload if new image is provided
-        new_image_base64 = data.get('newImageBase64')  # New field for image upload
-        if new_image_base64:
+        new_image_base64 = data.get('newImageBase64')
+        if new_image_base64:  # Only process if a new image is provided
             try:
                 # Upload the new image and get its URL
                 new_image_url = upload_image_to_blob(new_image_base64, employee_id)
@@ -657,10 +699,16 @@ async def update_employee(req: func.HttpRequest) -> func.HttpResponse:
                     status_code=500, 
                     mimetype="application/json"
                 )
+        else:
+            logging.info(f"No new image provided. Keeping existing image URL: {item.get('imageUrl')}")
 
+        # Define the allowed fields
+        allowed_fields = {
+            "employeeName", "role", "email", "organizationId"
+        }
         # Remove protected fields from the update data
         protected_fields = {'id', '_rid', '_self', '_etag', '_attachments', '_ts', 'employeeId', 'newImageBase64'}
-        update_data = {k: v for k, v in data.items() if k not in protected_fields}
+        update_data = {k: v for k, v in data.items() if k in allowed_fields and k not in protected_fields}
 
         # Update the existing employee record with new data
         item.update(update_data)
@@ -702,6 +750,7 @@ async def update_employee(req: func.HttpRequest) -> func.HttpResponse:
             status_code=500,
             mimetype="application/json"
         )
+
 
     
                     # Define the Azure Function for delete an employee
@@ -789,115 +838,70 @@ def fetch_employee_image(employee_id):
         return None
 
 
-@app.function_name(name="get_attendance_byfilter")
-@app.route(route="attendance/all", methods=['GET'])
+@app.function_name(name="get_all_attendance")
+@app.route(route='attendance/all', methods=[func.HttpMethod.GET])
 @require_auth
 async def get_all_attendance(req: func.HttpRequest) -> func.HttpResponse:
     """
-    Retrieve attendance records with optional filtering and pagination
+    Retrieve attendance records with optional filtering by employeeId and date.
+    Includes pagination and sorting by date (latest first).
     """
-    logging.info('Processing request to get attendance records.')
+    logging.info(f"Token validated for user: {req.user_info.get('email', 'unknown')}")
 
     try:
-        # Extract query parameters
-        date_param = req.params.get('date')
-        employee_id_param = req.params.get('employeeId')
+        # Extract pagination parameters (default: page 1, size 10)
         page_number = int(req.params.get('page_number', 1))
         page_size = int(req.params.get('page_size', 10))
-
-        # Validate date parameter if provided
-        if date_param:
-            try:
-                input_date = datetime.strptime(date_param, '%Y-%m-%d').date()
-                if input_date > datetime.today().date():
-                    return func.HttpResponse(
-                        body=json.dumps({
-                            'error': f'The date {date_param} is in the future. Please provide a valid date.'
-                        }),
-                        status_code=400,
-                        mimetype="application/json"
-                    )
-            except ValueError:
-                return func.HttpResponse(
-                    body=json.dumps({
-                        'error': 'Invalid date format. Use YYYY-MM-DD.'
-                    }),
-                    status_code=400,
-                    mimetype="application/json"
-                )
-        else:
-            input_date = None
-
-        # Calculate pagination offset
         offset = (page_number - 1) * page_size
 
-        # Construct base query
-        query = "SELECT * FROM c WHERE STARTSWITH(c.id, 'attendance_')"
+        # Get optional filters
+        employee_id = req.params.get('employeeId')
+        attendance_date = req.params.get('date')  # Expected format: YYYY-MM-DD
 
-        # Add optional filters
-        query_params = []
-        if input_date:
-            query += " AND c.date = @date"
-            query_params.append({"name": "@date", "value": date_param})
-        
-        if employee_id_param:
-            query += " AND c.employeeId = @employee_id"
-            query_params.append({"name": "@employee_id", "value": employee_id_param})
+        # Base query
+        query = "SELECT * FROM c WHERE 1=1"
+        parameters = []
 
-        # Add ordering and pagination
-        query += " ORDER BY c.employeeId ASC"
-        query += f" OFFSET {offset} LIMIT {page_size}"
+        # Apply employeeId filter if provided
+        if employee_id:
+            query += " AND c.employeeId = @employeeId"
+            parameters.append({"name": "@employeeId", "value": employee_id})
 
-        logging.info(f"Generated query: {query}")
+        # Apply date filter if provided
+        if attendance_date:
+            query += " AND c.date = @attendanceDate"
+            parameters.append({"name": "@attendanceDate", "value": attendance_date})
+
+        # Sort by date (descending) so latest records appear first
+        query += " ORDER BY c.date DESC"
 
         # Execute query
-        paginated_items = list(attendance_container.query_items(
-            query=query, 
-            parameters=query_params,
-            enable_cross_partition_query=True
+        all_items = list(attendance_container.query_items(
+            query=query, parameters=parameters, enable_cross_partition_query=True
         ))
-        logging.info(f"Paginated items count: {len(paginated_items)}")
 
-        # If no items found, return empty list
-        if not paginated_items:
-            return func.HttpResponse(
-                body=json.dumps([]),
-                status_code=200,
-                mimetype="application/json"
-            )
+        # Apply pagination
+        paginated_items = all_items[offset:offset + page_size]
 
-        # Enrich items with employee image URLs
-        for item in paginated_items:
-            employee_id = item.get('employeeId')
-            image_url = fetch_employee_image(employee_id)
-            if image_url:
-                item['imageUrl'] = image_url
-
-        # Return paginated attendance records
         return func.HttpResponse(
-            body=json.dumps(paginated_items),
+            body=json.dumps({
+                "page_number": page_number,
+                "page_size": page_size,
+                "total_records": len(all_items),
+                "data": paginated_items
+            }),
             status_code=200,
             mimetype="application/json"
         )
 
-    except exceptions.CosmosHttpResponseError as e:
-        logging.error(f"Failed to fetch attendance records: {str(e)}")
-        return func.HttpResponse(
-            body=json.dumps({
-                'error': f'Failed to fetch attendance records: {str(e)}'
-            }),
-            status_code=500,
-            mimetype="application/json"
-        )
     except Exception as e:
-        logging.error(f"Unexpected error in get_all_attendance: {str(e)}")
+        logging.error(f"Error fetching attendance records: {str(e)}")
         return func.HttpResponse(
-            body=json.dumps({
-                'error': 'An unexpected error occurred'
-            }),
+            body=json.dumps({'error': 'Internal Server Error'}),
             status_code=500,
             mimetype="application/json"
         )
+
 
 
 
@@ -1049,7 +1053,7 @@ async def saveCameraUrls(req: func.HttpRequest) -> func.HttpResponse:
         logging.info(f"User Info: {req.user_info}")  # Debugging log
 
         # Extract organizationId (same as sub/user_id)
-        organization_id = req.user_info.get('user_id')  # Fix applied here
+        organization_id = req.user_info.get('user_id')
 
         if not organization_id:
             return func.HttpResponse(
@@ -1060,28 +1064,37 @@ async def saveCameraUrls(req: func.HttpRequest) -> func.HttpResponse:
 
         # Parse the incoming JSON data
         req_body = req.get_json()
-        
-        # Extract and validate `cameraDetails1`
-        camera_details = req_body.get("cameraDetails1", [])
-        if not camera_details or not isinstance(camera_details, list):
+
+        # Extract email from request body or fallback to req.user_info
+        email = req_body.get("email") or req.user_info.get("email", "")
+
+        # Ensure email is not empty
+        if not email:
             return func.HttpResponse(
-                json.dumps({"detail": "Missing or invalid field: 'cameraDetails1'."}),
+                json.dumps({"error": "Email is missing in both request body and token."}),
                 status_code=400
             )
-        
+
+        # Extract and validate `cameraDetails1`
+        camera_details = req_body.get("cameraDetails", [])
+        if not camera_details or not isinstance(camera_details, list):
+            return func.HttpResponse(
+                json.dumps({"detail": "Missing or invalid field: 'cameraDetails'."}),
+                status_code=400
+            )
+
         validated_camera_details = []
         for detail in camera_details:
-            if not all(key in detail for key in ["email", "cameraI", "punchinUrl", "cameraII", "punchoutUrl"]):
+            if not all(key in detail for key in ["punchinCamera", "punchinUrl", "punchoutCamera", "punchoutUrl"]):
                 return func.HttpResponse(
-                    json.dumps({"detail": "Each item in 'cameraDetails1' must contain 'email', 'cameraI', 'punchinUrl', 'cameraII', and 'punchoutUrl'."}),
+                    json.dumps({"detail": "Each item in 'cameraDetails' must contain 'punchinCamera', 'punchinUrl', 'punchoutCamera', and 'punchoutUrl'."}),
                     status_code=400
                 )
 
             validated_camera_details.append({
-                "email": detail["email"],
-                "cameraI": detail["cameraI"],
+                "punchinCamera": detail["punchinCamera"],
                 "punchinUrl": detail["punchinUrl"],
-                "cameraII": detail["cameraII"],
+                "punchoutCamera": detail["punchoutCamera"],
                 "punchoutUrl": detail["punchoutUrl"]
             })
 
@@ -1092,7 +1105,8 @@ async def saveCameraUrls(req: func.HttpRequest) -> func.HttpResponse:
         if existing_records:
             # Update the existing record
             existing_record = existing_records[0]
-            existing_record["cameraDetails1"] = validated_camera_details
+            existing_record["email"] = email  # Update email at root level
+            existing_record["cameraDetails"] = validated_camera_details
             upsert_camera_urls(existing_record)  # Update record in Cosmos DB
             response_message = {"message": "Camera URLs updated successfully.", "id": existing_record["id"]}
         else:
@@ -1101,7 +1115,8 @@ async def saveCameraUrls(req: func.HttpRequest) -> func.HttpResponse:
             camera_data = {
                 "id": camera_id,
                 "organizationId": organization_id,  # Map to the organization
-                "cameraDetails1": validated_camera_details
+                "email": email,  # Store email at root level
+                "cameraDetails": validated_camera_details
             }
             upsert_camera_urls(camera_data)  # Insert new record into Cosmos DB
             response_message = {"message": "Camera URLs saved successfully.", "id": camera_id}
@@ -1117,6 +1132,7 @@ async def saveCameraUrls(req: func.HttpRequest) -> func.HttpResponse:
 
 
 
+
 def get_camera_record_by_email(email: str):
     query = f"SELECT * FROM c WHERE ARRAY_CONTAINS(c.cameraDetails1, {{'email': '{email}'}}, true)"
     items = list(camera_urls_container.query_items(query=query, enable_cross_partition_query=True))
@@ -1127,15 +1143,15 @@ def upsert_camera_urls(camera_data):
     # Upsert the item directly as a dictionary
     camera_urls_container.upsert_item(camera_data)
 
+
 # put method to update cameraurl -attendance
 @app.function_name(name="updateCameraUrl")
-@app.route(route='api/cameraUrl', methods=[func.HttpMethod.PUT])
+@app.route(route='api/editcameraUrl', methods=[func.HttpMethod.PUT])
 @require_auth
 async def updateCameraUrls(req: func.HttpRequest) -> func.HttpResponse:
-    # Validate and decode the token
     try:
-        user_info = validate_and_decode_token(req)
-        logging.info(f"Token validated for user: {user_info.get('email', 'unknown')}")
+        # Validate and decode the token
+        logging.info(f"Token validated for user: {req.user_info.get('email', 'unknown')}")
     except Exception as e:
         logging.error(f"Unauthorized Request: {str(e)}")
         return func.HttpResponse(
@@ -1158,14 +1174,14 @@ async def updateCameraUrls(req: func.HttpRequest) -> func.HttpResponse:
             )
         
         # Extract new camera details
-        camera_details = req_body.get("cameraDetails1", [])
+        camera_details = req_body.get("cameraDetails", [])
         
         if not camera_details:
             return func.HttpResponse(
-                json.dumps({"detail": "Missing required field: 'cameraDetails1'."}),
+                json.dumps({"detail": "Missing required field: 'cameraDetails'."}),
                 status_code=400
             )
-
+        
         # Fetch existing camera data
         existing_data = get_camera_data_by_id(camera_id)
         
@@ -1175,8 +1191,41 @@ async def updateCameraUrls(req: func.HttpRequest) -> func.HttpResponse:
                 status_code=404
             )
 
-        # Update the existing camera details with the new details
-        existing_data["cameraDetails1"] = camera_details
+        # Define allowed fields
+        allowed_fields = {"punchinCamera", "punchinUrl", "punchoutCamera", "punchoutUrl", "email"}
+        
+        # Validate and filter fields
+        validated_camera_details = []
+        for i, detail in enumerate(camera_details):
+            if not isinstance(detail, dict):
+                return func.HttpResponse(
+                    json.dumps({"detail": "Invalid format in 'cameraDetails'. Expected list of objects."}),
+                    status_code=400
+                )
+            
+            # Retain existing email if not provided
+            existing_email = (
+                existing_data["cameraDetails"][i].get("email", "") 
+                if i < len(existing_data["cameraDetails"]) 
+                else ""
+            )
+            
+            filtered_detail = {key: value for key, value in detail.items() if key in allowed_fields}
+            
+            # Retain email if it's missing in the request
+            if "email" not in filtered_detail:
+                filtered_detail["email"] = existing_email
+            
+            if set(filtered_detail.keys()) - {"email"} != allowed_fields - {"email"}:
+                return func.HttpResponse(
+                    json.dumps({"detail": "Invalid or missing fields in 'cameraDetails'. Only specific fields are allowed."}),
+                    status_code=400
+                )
+            
+            validated_camera_details.append(filtered_detail)
+
+        # Update the existing camera details with the validated details
+        existing_data["cameraDetails"] = validated_camera_details
         
         # Upsert the updated camera URLs into Cosmos DB
         upsert_camera_urls(existing_data)
@@ -1196,6 +1245,7 @@ async def updateCameraUrls(req: func.HttpRequest) -> func.HttpResponse:
             json.dumps({"detail": str(e)}),
             status_code=500
         )
+
 
 # GET method to retrieve camera URL by ID -attendance
 @app.function_name(name="attendanceGetCameraUrlById")
@@ -1251,14 +1301,13 @@ def get_camera_by_id(camera_id):
 @require_auth
 async def add_organization(req: func.HttpRequest) -> func.HttpResponse:
     logging.info(f"Token validated for user: {req.user_info.get('email', 'unknown')}")
-    logging.info(f"User Info: {req.user_info}")  # Debugging log
+    logging.info(f"User Info: {req.user_info}")
 
     try:
         json_data = req.get_json()
-
         if not json_data:
             return func.HttpResponse(
-                body=json.dumps({'error': 'JSON data is required in the request body'}),
+                json.dumps({'error': 'JSON data is required in the request body'}),
                 status_code=400,
                 mimetype="application/json"
             )
@@ -1272,38 +1321,48 @@ async def add_organization(req: func.HttpRequest) -> func.HttpResponse:
 
         if not organization_name:
             return func.HttpResponse(
-                body=json.dumps({'error': 'Organization name is mandatory'}),
+                json.dumps({'error': 'Organization name is mandatory'}),
                 status_code=400,
                 mimetype="application/json"
             )
 
-        # Use the sub (user_id) from the token as the organization ID
-        organization_id = req.user_info.get('user_id')  # Fix applied here
+        # Validate website URL format
+        valid_domain_pattern = r'^(https?://)?(www\.)?[\w-]+\.(com|net|org|io|co|edu|gov|info|biz|dev|app)$'
+        if website_url and not re.match(valid_domain_pattern, website_url):
+            return func.HttpResponse(
+                json.dumps({'error': 'Invalid website URL format. Must be like https://example.com'}),
+                status_code=400,
+                mimetype="application/json"
+            )
 
+        # Use `sub` (user_id) as the `id` and `organizationId`
+        organization_id = req.user_info.get('user_id')
         if not organization_id:
             return func.HttpResponse(
-                body=json.dumps({'error': 'Invalid token: user ID (sub) missing'}),
+                json.dumps({'error': 'Invalid token: user ID (sub) missing'}),
                 status_code=401,
                 mimetype="application/json"
             )
 
-        # Check if the organization already exists for this user
-        query = f"SELECT * FROM c WHERE c.id = '{organization_id}'"
+        # Check if an organization with the same name exists (case-insensitive)
+        query = "SELECT * FROM c WHERE LOWER(c.organizationName) = @organizationName"
+        parameters = [{"name": "@organizationName", "value": organization_name.lower()}]
+
         existing_organizations = list(organization_container_name.query_items(
-            query=query, enable_cross_partition_query=True
+            query=query, parameters=parameters, enable_cross_partition_query=True
         ))
 
         if existing_organizations:
             return func.HttpResponse(
-                body=json.dumps({'warn': f'Organization already exists for this user'}),
+                json.dumps({'error': 'Organization name already exists'}),
                 status_code=409,
                 mimetype="application/json"
             )
 
-        # Create organization record
+        # Create or update organization record
         organization_record = {
-            'id': organization_id,  # Use the user's ID as organizationId
-            'organizationId':organization_id,
+            'id': organization_id,  # Ensure `id` is the `sub` (user_id)
+            'organizationId': organization_id,
             'organizationName': organization_name,
             'phoneNumber': phone_number,
             'websiteUrl': website_url,
@@ -1312,11 +1371,11 @@ async def add_organization(req: func.HttpRequest) -> func.HttpResponse:
             'createdAt': datetime.utcnow().isoformat(),
         }
 
-        # Save to Cosmos DB
-        organization_container_name.create_item(body=organization_record)
+        # Use `upsert_item()` to avoid conflicts
+        organization_container_name.upsert_item(organization_record)
 
         return func.HttpResponse(
-            body=json.dumps({'message': 'Organization added successfully', 'organizationId': organization_id}),
+            json.dumps({'message': 'Organization added successfully', 'organizationId': organization_id}),
             status_code=201,
             mimetype="application/json"
         )
@@ -1324,30 +1383,17 @@ async def add_organization(req: func.HttpRequest) -> func.HttpResponse:
     except Exception as e:
         logging.error(f"Error adding organization: {str(e)}")
         return func.HttpResponse(
-            body=json.dumps({'error': str(e)}),
+            json.dumps({'error': 'Internal Server Error'}),
             status_code=500,
             mimetype="application/json"
         )
 
-
-     
 
 
 
 # tracker api's
 
 
-# Pydantic Models
-class CameraDetail(BaseModel):
-    entranceName: str
-    cameraPosition: Literal["inside-out", "outside-in"]
-    videoUrl: str
-    doorCoordinates: Optional[List[List[int]]] = None
-
-class PageData(BaseModel):
-    capacityOfPeople: int
-    alertMessage: Literal["0-20", "20-40", "40-60", "60-80", "80-100"]
-    cameraDetails: List[CameraDetail]
 
 def upsert_document(container, data: dict):
     try:
@@ -1520,6 +1566,7 @@ async def authenticated_save_data(req: func.HttpRequest) -> func.HttpResponse:
         user_id = user_info['user_id']
         organization_id = user_info['sub']
  
+        # Check if data for this organization already exists
         query = "SELECT * FROM c WHERE c.organization_id = @organization_id"
         parameters = [{"name": "@organization_id", "value": organization_id}]
        
@@ -1530,24 +1577,13 @@ async def authenticated_save_data(req: func.HttpRequest) -> func.HttpResponse:
         ))
  
         if existing_items:
-            existing_item = existing_items[0]
-            existing_item["capacityOfPeople"] = data.capacityOfPeople
-            existing_item["alertMessage"] = data.alertMessage
-            existing_item["cameraDetails"] = [camera.dict() for camera in data.cameraDetails]
-            existing_item["organization_id"] = organization_id
-            existing_item["user_id"] = user_id
-            # Preserve existing counts, persons, and log without updating
-            existing_item["counts"] = existing_item.get("counts", [])
-            existing_item["persons"] = existing_item.get("persons", [])
-            existing_item["logs"] = existing_item.get("logs", [])
- 
-            upsert_document(setup_container, existing_item)
+            # If data already exists, return a message to use edit API instead
             return func.HttpResponse(
                 json.dumps({
-                    "message": "Data updated successfully.",
-                    "documentId": existing_item["id"]
+                    "message": "Data already exists. Use the edit API to update.",
+                    "documentId": existing_items[0]["id"]
                 }),
-                status_code=200
+                status_code=409
             )
         else:
             document_id = str(uuid.uuid4())
@@ -1556,13 +1592,14 @@ async def authenticated_save_data(req: func.HttpRequest) -> func.HttpResponse:
                 "user_id": user_id,
                 "organization_id": organization_id,
                 "capacityOfPeople": data.capacityOfPeople,
-                "alertMessage": data.alertMessage,
-                "cameraDetails": [camera.dict() for camera in data.cameraDetails],
-                "counts": [],
-                "persons": [],
-                "logs": []
+                "alertMessage": data.alertMessage,  # Changed to alertMessage
+                "cameraDetails": [camera.dict() for camera in data.cameraDetails]
+                # Removed counts, persons, logs
             }
-            upsert_document(setup_container, document)
+           
+            # Insert the new document
+            setup_container.create_item(body=document)
+           
             return func.HttpResponse(
                 json.dumps({
                     "message": "Data saved successfully.",
@@ -1574,9 +1611,10 @@ async def authenticated_save_data(req: func.HttpRequest) -> func.HttpResponse:
     except Exception as e:
         logging.error(f"Error processing request: {str(e)}")
         return func.HttpResponse(
-            json.dumps({"detail": "An error occurred during processing."}),
+            json.dumps({"detail": f"An error occurred during processing: {str(e)}"}),
             status_code=500
         )
+ 
  
  
  
@@ -1590,7 +1628,7 @@ async def getCameraUrls(req: func.HttpRequest) -> func.HttpResponse:
     organization_id = user_info['sub']
  
     try:
-        query = "SELECT c.cameraDetails FROM c WHERE c.organization_id = @organization_id"
+        query = "SELECT c FROM c WHERE c.organization_id = @organization_id"
         parameters = [{"name": "@organization_id", "value": organization_id}]
        
         items = list(setup_container.query_items(
@@ -1599,22 +1637,45 @@ async def getCameraUrls(req: func.HttpRequest) -> func.HttpResponse:
             enable_cross_partition_query=True
         ))
        
-        video_urls = []
         if items:
-            camera_details = items[0].get("cameraDetails", [])
-            video_urls = [camera["videoUrl"] for camera in camera_details if "videoUrl" in camera]
-       
-        return func.HttpResponse(
-            json.dumps({"videoUrls": video_urls}),
-            status_code=200
-        )
+            # Get the document
+            doc = items[0]
+           
+            # Check if 'c' key exists in the document (based on your original data structure)
+            if 'c' in doc:
+                c_data = doc['c']
+                filtered_data = {
+                    "capacityOfPeople": c_data.get("capacityOfPeople"),
+                    "alertMessage": c_data.get("alertMessage"),
+                    "cameraDetails": c_data.get("cameraDetails")
+                }
+            else:
+                # Directly access the fields if 'c' doesn't exist
+                filtered_data = {
+                    "capacityOfPeople": doc.get("capacityOfPeople"),
+                    "alertMessage": doc.get("alertMessage"),
+                    "cameraDetails": doc.get("cameraDetails")
+                }
+           
+            # Return data with the "data" key
+            return func.HttpResponse(
+                json.dumps({"data": filtered_data}),
+                status_code=200
+            )
+        else:
+            # No data found for this organization
+            return func.HttpResponse(
+                json.dumps({"data": {}}),
+                status_code=200
+            )
    
     except Exception as e:
-        logging.error(f"Error retrieving camera URLs: {str(e)}")
+        logging.error(f"Error retrieving data: {str(e)}")
         return func.HttpResponse(
-            json.dumps({"detail": "An error occurred while retrieving camera URLs."}),
+            json.dumps({"detail": "An error occurred while retrieving the data."}),
             status_code=500
         )
+   
  
 @app.function_name(name="getPersonDetectionOverTime")
 @app.route(route='api/getPersonDetectionOverTime', methods=[func.HttpMethod.GET])
@@ -1624,77 +1685,110 @@ async def get_person_detection_over_time(req: func.HttpRequest) -> func.HttpResp
     user_id = user_info['sub']
  
     try:
-        # Query to get person detections and capacity
-        query = """
-        SELECT
-            c.persons,
-            c.capacityOfPeople
+        # Query to get capacity from setup container
+        capacity_query = """
+        SELECT c.capacityOfPeople
         FROM c
         WHERE c.user_id = @user_id
         """
         parameters = [{"name": "@user_id", "value": user_id}]
        
-        items = list(setup_container.query_items(
-            query=query,
+        setup_items = list(setup_container.query_items(
+            query=capacity_query,
             parameters=parameters,
             enable_cross_partition_query=True
         ))
  
-        if not items:
+        if not setup_items:
             return func.HttpResponse(
                 json.dumps({"data": []}),
                 status_code=200
             )
  
-        capacity = items[0].get("capacityOfPeople", 0)
+        capacity = setup_items[0].get("capacityOfPeople", 0)
         if capacity == 0:
             return func.HttpResponse(
                 json.dumps({"error": "Capacity not set or is zero"}),
                 status_code=400
             )
  
-        # Dictionary to store unique persons per hour per camera
-        persons_by_hour = defaultdict(lambda: defaultdict(set))
+        # Query to get person logs from user_logs table
+        logs_query = """
+        SELECT c.logs
+        FROM c
+        WHERE c.user_id = @user_id
+        """
        
-        # Process person detections and group by hour
-        for item in items:
-            persons = item.get("persons", [])
-            for person in persons:
-                timestamp = person.get("timestamp")
-                person_id = person.get("id")
-                camera_id = person.get("camera_id")
+        logs_items = list(user_logs_container.query_items(
+            query=logs_query,
+            parameters=parameters,
+            enable_cross_partition_query=True
+        ))
  
-                if timestamp and person_id and camera_id:
-                    # Convert timestamp to datetime and truncate to hour
-                    dt = datetime.datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
-                    # Reset minutes and seconds to get exact hour
-                    dt = dt.replace(minute=0, second=0, microsecond=0)
-                    hour_key = dt.strftime("%Y-%m-%d %H")  # Use 24-hour format for sorting
-                    persons_by_hour[hour_key][camera_id].add(person_id)
+        if not logs_items or "logs" not in logs_items[0]:
+            return func.HttpResponse(
+                json.dumps({"data": []}),
+                status_code=200
+            )
  
+        # Dictionary to count entries and exits per hour per camera
+        entry_counts_by_hour = defaultdict(lambda: defaultdict(int))
+        exit_counts_by_hour = defaultdict(lambda: defaultdict(int))
+       
+        # Process logs and group by hour
+        logs = logs_items[0].get("logs", [])
+        for log in logs:
+            timestamp = log.get("timestamp")
+            camera_id = log.get("camera_id")
+            event_type = log.get("event_type")
+ 
+            if timestamp and camera_id and event_type:
+                # Convert timestamp to pendulum and truncate to hour
+                dt = pendulum.parse(timestamp)
+                # Reset minutes and seconds to get exact hour
+                dt = dt.start_of('hour')
+                hour_key = dt.format('YYYY-MM-DD HH')
+               
+                if event_type == "person_entry":
+                    entry_counts_by_hour[hour_key][camera_id] += 1
+                elif event_type == "person_exit":
+                    exit_counts_by_hour[hour_key][camera_id] += 1
+ 
+        # Get a set of all hour keys from both entries and exits
+        all_hour_keys = set(entry_counts_by_hour.keys()) | set(exit_counts_by_hour.keys())
+       
         # Create time series data with hourly counts and percentages
         time_series_data = []
        
-        for hour_key, camera_data in sorted(persons_by_hour.items()):
-            hour_total_unique_persons = set()
+        for hour_key in sorted(all_hour_keys):
             camera_counts = {}
+            total_entries = 0
+            total_exits = 0
            
-            # Calculate per-camera counts for this hour
-            for camera_id, person_ids in camera_data.items():
-                camera_counts[camera_id] = len(person_ids)
-                hour_total_unique_persons.update(person_ids)
+            # Get all camera IDs for this hour
+            all_cameras = set(entry_counts_by_hour[hour_key].keys()) | set(exit_counts_by_hour[hour_key].keys())
            
-            total_count = len(hour_total_unique_persons)
+            # Calculate net count for each camera
+            for camera_id in all_cameras:
+                entries = entry_counts_by_hour[hour_key][camera_id]
+                exits = exit_counts_by_hour[hour_key][camera_id]
+                net_count = entries - exits
+               
+                camera_counts[camera_id] = net_count
+                total_entries += entries
+                total_exits += exits
+           
+            total_count = total_entries - total_exits
             percentage = (total_count / capacity * 100) if capacity > 0 else 0
            
-            # Parse the datetime and create hour range
-            dt = datetime.datetime.strptime(hour_key, "%Y-%m-%d %H")
-            next_hour = dt + datetime.timedelta(hours=1)
+            # Parse the hour key and create hour range
+            dt = pendulum.from_format(hour_key, 'YYYY-MM-DD HH')
+            next_hour = dt.add(hours=1)
            
-            hour_range = f"{dt.strftime('%I:%M %p')} - {next_hour.strftime('%I:%M %p')}"
+            hour_range = f"{dt.format('h:mm A')} - {next_hour.format('h:mm A')}"
            
             time_series_data.append({
-                "date": dt.strftime("%Y-%m-%d"),
+                "date": dt.format('YYYY-MM-DD'),
                 "hour_range": hour_range,
                 "total_person_count": total_count,
                 "camera_counts": camera_counts,
@@ -1702,8 +1796,10 @@ async def get_person_detection_over_time(req: func.HttpRequest) -> func.HttpResp
             })
  
         # Sort data by datetime
-        time_series_data.sort(key=lambda x: datetime.datetime.strptime(x['date'] + ' ' + x['hour_range'].split(' - ')[0],
-                                          "%Y-%m-%d %I:%M %p"))
+        time_series_data.sort(key=lambda x: pendulum.from_format(
+            f"{x['date']} {x['hour_range'].split(' - ')[0]}",
+            'YYYY-MM-DD h:mm A'
+        ))
  
         return func.HttpResponse(
             json.dumps({
@@ -1719,7 +1815,7 @@ async def get_person_detection_over_time(req: func.HttpRequest) -> func.HttpResp
             json.dumps({"detail": "An unexpected error occurred."}),
             status_code=500
         )
- 
+
 @app.function_name(name="getAllCounts")
 @app.route(route='api/getAllCounts', methods=[func.HttpMethod.GET])
 @require_auth
@@ -1728,24 +1824,36 @@ async def getAllCounts(req: func.HttpRequest) -> func.HttpResponse:
     user_id = user_info['sub']
    
     try:
-        # Query to get counts and capacity for the user
-        query = """
-        SELECT
-            c.counts,
-            c.capacityOfPeople,
-            c.camera_details
+        # Query to get capacity from setup container
+        capacity_query = """
+        SELECT c.capacityOfPeople
         FROM c
         WHERE c.user_id = @user_id
         """
         parameters = [{"name": "@user_id", "value": user_id}]
        
-        items = list(setup_container.query_items(
-            query=query,
+        setup_items = list(setup_container.query_items(
+            query=capacity_query,
             parameters=parameters,
             enable_cross_partition_query=True
         ))
        
-        if not items:
+        capacity = setup_items[0].get("capacityOfPeople", 0) if setup_items else 0
+       
+        # Query to get counts from user_counts table
+        counts_query = """
+        SELECT c.cameras, c.last_updated
+        FROM c
+        WHERE c.user_id = @user_id
+        """
+       
+        count_items = list(user_counts_container.query_items(
+            query=counts_query,
+            parameters=parameters,
+            enable_cross_partition_query=True
+        ))
+       
+        if not count_items and not setup_items:
             return func.HttpResponse(
                 json.dumps({
                     "camera_counts": {},
@@ -1757,28 +1865,26 @@ async def getAllCounts(req: func.HttpRequest) -> func.HttpResponse:
                 status_code=200
             )
        
-        item = items[0]
-        counts = item.get("counts", [])
-        capacity = item.get("capacityOfPeople", 0)
-       
         # Calculate counts for each camera
         camera_counts = {}
         total_current_count = 0
        
-        for count in counts:
-            camera_id = count.get("camera_id", "")
-            entry = count.get("entry", 0)
-            exit = count.get("exit", 0)
-            current_count = entry - exit
+        if count_items:
+            cameras_data = count_items[0].get("cameras", {})
            
-            camera_counts[camera_id] = {
-                "entry": entry,
-                "exit": exit,
-                "current_count": current_count,
-                "last_updated": count.get("last_updated", "")
-            }
-           
-            total_current_count += current_count
+            for camera_id, camera_data in cameras_data.items():
+                entry = camera_data.get("entry_count", 0)
+                exit = camera_data.get("exit_count", 0)
+                current_count = entry - exit
+               
+                camera_counts[camera_id] = {
+                    "entry": entry,
+                    "exit": exit,
+                    "current_count": current_count,
+                    "last_updated": camera_data.get("timestamp", "")
+                }
+               
+                total_current_count += current_count
        
         # Calculate occupancy percentage
         occupancy_percentage = (total_current_count / capacity * 100) if capacity > 0 else 0
@@ -1807,3 +1913,422 @@ async def getAllCounts(req: func.HttpRequest) -> func.HttpResponse:
 
 
 
+class CameraDetail(BaseModel):
+    entranceName: str
+    cameraPosition: Literal["inside-out", "outside-in"]
+    videoUrl: str
+    doorCoordinates: Optional[List[List[int]]] = None
+ 
+class PageData(BaseModel):
+    capacityOfPeople: int
+    alertMessage: str
+    documentId: str = None
+    cameraDetails: List[CameraDetail]
+
+
+@app.function_name(name="editData")
+@app.route(route='api/editData', methods=[func.HttpMethod.PUT])
+@require_auth
+async def authenticated_edit_data(req: func.HttpRequest) -> func.HttpResponse:
+    user_info = req.user_info
+    try:
+        req_body = req.get_json()
+        data = PageData(**req_body)
+        user_id = user_info['user_id']
+        organization_id = user_info['sub']
+ 
+        # Find the document for this organization
+        query = "SELECT * FROM c WHERE c.organization_id = @organization_id"
+        parameters = [{"name": "@organization_id", "value": organization_id}]
+       
+        existing_items = list(setup_container.query_items(
+            query=query,
+            parameters=parameters,
+            enable_cross_partition_query=True
+        ))
+ 
+        if not existing_items:
+            return func.HttpResponse(
+                json.dumps({"detail": "No data found for this organization."}),
+                status_code=404
+            )
+ 
+        existing_item = existing_items[0]
+        document_id = existing_item["id"]
+       
+        # Update the document with new values
+        updated_document = {
+            "id": document_id,
+            "user_id": user_id,
+            "organization_id": organization_id,
+            "capacityOfPeople": data.capacityOfPeople,
+            "alertMessage": data.alertMessage,  
+            "cameraDetails": [camera.dict() for camera in data.cameraDetails]
+            # Removed counts, persons, logs
+        }
+       
+        # Replace the existing document
+        setup_container.replace_item(
+            item=document_id,
+            body=updated_document
+        )
+       
+        return func.HttpResponse(
+            json.dumps({
+                "message": "Data updated successfully.",
+                "documentId": document_id
+            }),
+            status_code=200
+        )
+ 
+    except Exception as e:
+        logging.error(f"Error processing request: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"detail": f"An error occurred during processing: {str(e)}"}),
+            status_code=500
+        )
+ 
+ 
+@app.function_name(name="deleteData")
+@app.route(route='api/deleteData', methods=[func.HttpMethod.DELETE])
+@require_auth
+async def authenticated_delete_data(req: func.HttpRequest) -> func.HttpResponse:
+    user_info = req.user_info
+    try:
+        organization_id = user_info['sub']
+ 
+        # Find the document for this organization
+        query = "SELECT * FROM c WHERE c.organization_id = @organization_id"
+        parameters = [{"name": "@organization_id", "value": organization_id}]
+       
+        existing_items = list(setup_container.query_items(
+            query=query,
+            parameters=parameters,
+            enable_cross_partition_query=True
+        ))
+ 
+        if not existing_items:
+            return func.HttpResponse(
+                json.dumps({"detail": "No data found for this organization."}),
+                status_code=404
+            )
+ 
+        document_id = existing_items[0]["id"]
+       
+        # Delete the document
+        setup_container.delete_item(
+            item=document_id,
+            partition_key=document_id
+        )
+       
+        return func.HttpResponse(
+            json.dumps({
+                "message": "Data deleted successfully."
+            }),
+            status_code=200
+        )
+ 
+    except Exception as e:
+        logging.error(f"Error processing request: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"detail": f"An error occurred during processing: {str(e)}"}),
+            status_code=500
+        )
+    
+
+
+@app.function_name(name="checkUserExists")
+@app.route(route='api/checkUserExists', methods=[func.HttpMethod.GET])
+@require_auth
+async def check_user_exists(req: func.HttpRequest) -> func.HttpResponse:
+    user_info = req.user_info
+    organization_id = user_info['sub']
+   
+    try:
+        # Query the setup-details container to check if the organization ID exists
+        query = "SELECT VALUE COUNT(1) FROM c WHERE c.organization_id = @organization_id"
+        parameters = [{"name": "@organization_id", "value": organization_id}]
+       
+        items = list(setup_container.query_items(
+            query=query,
+            parameters=parameters,
+            enable_cross_partition_query=True
+        ))
+       
+        # items[0] will contain the count (0 if not found, ≥1 if found)
+        user_exists = items[0] > 0
+       
+        return func.HttpResponse(
+            json.dumps({
+                "data": {
+                    "exists": user_exists,
+                    "message": "User exists" if user_exists else "User does not exist"
+                }
+            }),
+            mimetype="application/json",
+            status_code=200
+        )
+    except Exception as e:
+        logging.error(f"Error checking if user exists: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"detail": "An error occurred while checking if the user exists."}),
+            mimetype="application/json",
+            status_code=500
+        )
+ 
+
+@app.function_name(name="get_organization_camera_data")
+@app.route(route='api/organization/camera-data', methods=[func.HttpMethod.GET])
+@require_auth
+async def get_organization_camera_data(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        # Extract organizationId from token (sub claim)
+        organization_id = req.user_info.get('sub')
+
+        if not organization_id:
+            return func.HttpResponse(
+                json.dumps({"error": "Invalid token: organizationId (sub) missing"}),
+                status_code=401,
+                mimetype="application/json"
+            )
+
+        # Fetch organization details
+        org_query = "SELECT * FROM c WHERE c.organizationId = @organizationId"
+        org_params = [{"name": "@organizationId", "value": organization_id}]
+
+        organization = list(organization_container_name.query_items(
+            query=org_query, 
+            parameters=org_params, 
+            enable_cross_partition_query=True
+        ))
+
+        # Fetch camera URLs
+        camera_query = "SELECT * FROM c WHERE c.organizationId = @organizationId"
+        camera_params = [{"name": "@organizationId", "value": organization_id}]
+
+        camera_urls = list(camera_urls_container.query_items(
+            query=camera_query, 
+            parameters=camera_params, 
+            enable_cross_partition_query=True
+        ))
+
+        # Build the response
+        response_data = {
+            "organizationData": organization[0] if organization else {},
+            "cameraData": camera_urls[0] if camera_urls else {
+                "cameraDetails": []
+            }
+        }
+
+        return func.HttpResponse(
+            json.dumps(response_data),
+            status_code=200,
+            mimetype="application/json"
+        )
+
+    except Exception as e:
+        logging.error(f"Error fetching organization and camera data for {organization_id}: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"error": "Internal server error"}),
+            status_code=500,
+            mimetype="application/json"
+        )
+
+@app.function_name(name="getPersonCountByDate")
+@app.route(route='api/getPersonCountByDate', methods=[func.HttpMethod.GET])
+@require_auth
+async def get_person_count_by_date(req: func.HttpRequest) -> func.HttpResponse:
+    user_info = req.user_info
+    user_id = user_info['sub']
+   
+    # Get the date parameter from the request query string
+    # If not provided, use current date
+    date_param = req.params.get('date')
+    if not date_param:
+        # Use current date if no date parameter is provided
+        selected_date = pendulum.now().format('YYYY-MM-DD')
+    else:
+        # Parse and validate the date format (YYYY-MM-DD)
+        try:
+            selected_date = pendulum.parse(date_param).format('YYYY-MM-DD')
+        except Exception as e:
+            return func.HttpResponse(
+                json.dumps({"error": f"Invalid date format. Please use YYYY-MM-DD. Details: {str(e)}"}),
+                status_code=400
+            )
+   
+    try:
+        # Query to get person logs from user_logs table
+        logs_query = """
+        SELECT c.logs
+        FROM c
+        WHERE c.user_id = @user_id
+        """
+        parameters = [{"name": "@user_id", "value": user_id}]
+       
+        logs_items = list(user_logs_container.query_items(
+            query=logs_query,
+            parameters=parameters,
+            enable_cross_partition_query=True
+        ))
+ 
+        if not logs_items or "logs" not in logs_items[0]:
+            # Return empty data with the simplified structure
+            return func.HttpResponse(
+                json.dumps({
+                    "data": {
+                        "date": selected_date,
+                        "total_entries": 0,
+                        "total_exits": 0,
+                        "total_count": 0,
+                        "camera_data": []
+                    }
+                }),
+                status_code=200,
+                mimetype="application/json"
+            )
+ 
+        # Dictionary to count entries and exits per camera
+        camera_entry_counts = defaultdict(int)
+        camera_exit_counts = defaultdict(int)
+        all_cameras = set()
+       
+        # Process logs and filter by selected date
+        logs = logs_items[0].get("logs", [])
+        for log in logs:
+            timestamp = log.get("timestamp")
+            camera_id = log.get("camera_id")
+            event_type = log.get("event_type")
+ 
+            if timestamp and camera_id and event_type:
+                # Parse timestamp and check if it's on the selected date
+                log_date = pendulum.parse(timestamp).format('YYYY-MM-DD')
+               
+                if log_date == selected_date:
+                    all_cameras.add(camera_id)
+                   
+                    if event_type == "person_entry":
+                        camera_entry_counts[camera_id] += 1
+                    elif event_type == "person_exit":
+                        camera_exit_counts[camera_id] += 1
+       
+        # Calculate totals
+        total_entries = sum(camera_entry_counts.values())
+        total_exits = sum(camera_exit_counts.values())
+        total_count = total_entries - total_exits
+       
+        # Prepare camera-specific data
+        camera_data = []
+        for camera_id in all_cameras:
+            entries = camera_entry_counts[camera_id]
+            exits = camera_exit_counts[camera_id]
+            net_count = entries - exits
+           
+            camera_data.append({
+                "camera_id": camera_id,
+                "entries": entries,
+                "exits": exits,
+                "net_count": net_count
+            })
+           
+        # Sort camera data by camera_id for consistency
+        camera_data.sort(key=lambda x: x["camera_id"])
+       
+        # Prepare the response with the simplified format
+        return func.HttpResponse(
+            json.dumps({
+                "data": {
+                    "date": selected_date,
+                    "total_entries": total_entries,
+                    "total_exits": total_exits,
+                    "total_count": total_count,
+                    "camera_data": camera_data
+                }
+            }),
+            status_code=200,
+            mimetype="application/json"
+        )
+ 
+    except Exception as e:
+        logging.error(f"Unexpected error in getPersonCountByDate: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"detail": f"An unexpected error occurred: {str(e)}"}),
+            status_code=500,
+            mimetype="application/json"
+        )
+    
+
+
+@app.function_name(name="update_organization_camera_data")
+@app.route(route="update_organization_camera_data", methods=[func.HttpMethod.PUT])
+async def update_organization_camera_data(req: func.HttpRequest) -> func.HttpResponse:
+    logging.info(f"Request received for updating organization and camera data")
+
+    try:
+        req_body = req.get_json()
+        organization_data = req_body.get("organizationData")
+        camera_data = req_body.get("cameraData")
+
+        if not organization_data or not camera_data:
+            logging.error("Both organizationData and cameraData are required.")
+            return func.HttpResponse(
+                json.dumps({"error": "Both organizationData and cameraData are required."}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        # Validate mandatory fields
+        mandatory_org_fields = [
+            "organizationId", "organizationName", "phoneNumber",
+            "websiteUrl", "domainName", "address"
+        ]
+        mandatory_cam_fields = ["organizationId", "email", "cameraDetails"]
+
+        for field in mandatory_org_fields:
+            if field not in organization_data:
+                logging.error(f"Missing mandatory field in organizationData: {field}")
+                return func.HttpResponse(
+                    json.dumps({"error": f"Missing mandatory field in organizationData: {field}"}),
+                    status_code=400,
+                    mimetype="application/json"
+                )
+
+        for field in mandatory_cam_fields:
+            if field not in camera_data:
+                logging.error(f"Missing mandatory field in cameraData: {field}")
+                return func.HttpResponse(
+                    json.dumps({"error": f"Missing mandatory field in cameraData: {field}"}),
+                    status_code=400,
+                    mimetype="application/json"
+                )
+
+        # Upsert (Insert or Update) organization data
+        organization_container_name.upsert_item(organization_data)
+        logging.info(f"Organization data updated: {organization_data['organizationId']}")
+
+        # Upsert (Insert or Update) camera data
+        camera_urls_container.upsert_item(camera_data)
+        logging.info(f"Camera data updated for organizationId: {camera_data['organizationId']}")
+
+        return func.HttpResponse(
+            json.dumps({"message": "Organization and camera data updated successfully"}),
+            status_code=200,
+            mimetype="application/json"
+        )
+
+    except exceptions.CosmosHttpResponseError as e:
+        logging.error(f"Cosmos DB Error: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"error": f"Cosmos DB Error: {str(e)}"}),
+            status_code=500,
+            mimetype="application/json"
+        )
+
+    except Exception as e:
+        logging.error(f"Unexpected error: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"error": "Internal server error"}),
+            status_code=500,
+            mimetype="application/json"
+        )
+ 
