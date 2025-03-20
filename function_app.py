@@ -75,6 +75,9 @@ CLIENT_ID = os.getenv("AZURE_B2C_CLIENT_ID")
 CLIENT_SECRET = os.getenv("AZURE_B2C_CLIENT_SECRET")
 USER_COUNTS=os.getenv('USER_COUNTS')
 USER_LOGS=os.getenv('USER_LOGS')
+GRAPH_API_URL = os.getenv('GRAPH_API_URL')
+GRAPH_SCOPE = os.getenv('GRAPH_SCOPE')
+
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)  # Set the logging level to DEBUG
 
@@ -2297,8 +2300,8 @@ async def update_organization_camera_data(req: func.HttpRequest) -> func.HttpRes
 
 
 
-GRAPH_API_URL = "https://graph.microsoft.com/v1.0"
-GRAPH_SCOPE = "https://graph.microsoft.com/.default"
+# GRAPH_API_URL = "https://graph.microsoft.com/v1.0"
+# GRAPH_SCOPE = "https://graph.microsoft.com/.default"
 
 
 
