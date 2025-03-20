@@ -1,3 +1,4 @@
+import asyncio
 import functools
 import json
 import logging
@@ -1144,7 +1145,8 @@ def upsert_camera_urls(camera_data):
     camera_urls_container.upsert_item(camera_data)
 
 
-# put method to update cameraurl -attendance
+
+# PUT method to update camera URL - Attendance
 @app.function_name(name="updateCameraUrl")
 @app.route(route='api/editcameraUrl', methods=[func.HttpMethod.PUT])
 @require_auth
@@ -1175,58 +1177,54 @@ async def updateCameraUrls(req: func.HttpRequest) -> func.HttpResponse:
         
         # Extract new camera details
         camera_details = req_body.get("cameraDetails", [])
-        
+
         if not camera_details:
             return func.HttpResponse(
                 json.dumps({"detail": "Missing required field: 'cameraDetails'."}),
                 status_code=400
             )
-        
+
         # Fetch existing camera data
         existing_data = get_camera_data_by_id(camera_id)
-        
+
         if not existing_data:
             return func.HttpResponse(
                 json.dumps({"detail": f"No camera data found for ID: {camera_id}."}),
                 status_code=404
             )
 
-        # Define allowed fields
-        allowed_fields = {"punchinCamera", "punchinUrl", "punchoutCamera", "punchoutUrl", "email"}
-        
-        # Validate and filter fields
+        # Retain the existing email if a new one is not provided
+        existing_email = existing_data.get("email", "")
+        new_email = req_body.get("email", existing_email)
+
+        # Define the allowed fields for cameraDetails
+        allowed_fields = {"punchinCamera", "punchinUrl", "punchoutCamera", "punchoutUrl"}
+
+        # Validate and clean up camera details
         validated_camera_details = []
-        for i, detail in enumerate(camera_details):
+        for detail in camera_details:
             if not isinstance(detail, dict):
                 return func.HttpResponse(
                     json.dumps({"detail": "Invalid format in 'cameraDetails'. Expected list of objects."}),
                     status_code=400
                 )
-            
-            # Retain existing email if not provided
-            existing_email = (
-                existing_data["cameraDetails"][i].get("email", "") 
-                if i < len(existing_data["cameraDetails"]) 
-                else ""
-            )
-            
+
+            # Filter only allowed fields
             filtered_detail = {key: value for key, value in detail.items() if key in allowed_fields}
-            
-            # Retain email if it's missing in the request
-            if "email" not in filtered_detail:
-                filtered_detail["email"] = existing_email
-            
-            if set(filtered_detail.keys()) - {"email"} != allowed_fields - {"email"}:
+
+            # Ensure all required fields exist
+            if set(filtered_detail.keys()) != allowed_fields:
                 return func.HttpResponse(
                     json.dumps({"detail": "Invalid or missing fields in 'cameraDetails'. Only specific fields are allowed."}),
                     status_code=400
                 )
-            
+
             validated_camera_details.append(filtered_detail)
 
-        # Update the existing camera details with the validated details
+        # Update the existing camera data with cleaned camera details and email
         existing_data["cameraDetails"] = validated_camera_details
-        
+        existing_data["email"] = new_email  # Ensure email is outside cameraDetails
+
         # Upsert the updated camera URLs into Cosmos DB
         upsert_camera_urls(existing_data)
 
@@ -1234,7 +1232,7 @@ async def updateCameraUrls(req: func.HttpRequest) -> func.HttpResponse:
             json.dumps({"detail": "Camera details updated successfully."}),
             status_code=200
         )
-        
+
     except ValueError:
         return func.HttpResponse(
             json.dumps({"detail": "Invalid JSON format."}),
@@ -2258,24 +2256,15 @@ async def get_person_count_by_date(req: func.HttpRequest) -> func.HttpResponse:
         )
     
 
-
-@app.function_name(name="update_organization_camera_data")
-@app.route(route="update_organization_camera_data", methods=[func.HttpMethod.PUT])
+@app.route(route="update_organization_camera_data", methods=["PUT"])
 async def update_organization_camera_data(req: func.HttpRequest) -> func.HttpResponse:
-    logging.info(f"Request received for updating organization and camera data")
-
     try:
         req_body = req.get_json()
         organization_data = req_body.get("organizationData")
         camera_data = req_body.get("cameraData")
 
         if not organization_data or not camera_data:
-            logging.error("Both organizationData and cameraData are required.")
-            return func.HttpResponse(
-                json.dumps({"error": "Both organizationData and cameraData are required."}),
-                status_code=400,
-                mimetype="application/json"
-            )
+            return func.HttpResponse("Both organizationData and cameraData are required.", status_code=400)
 
         # Validate mandatory fields
         mandatory_org_fields = [
@@ -2286,49 +2275,201 @@ async def update_organization_camera_data(req: func.HttpRequest) -> func.HttpRes
 
         for field in mandatory_org_fields:
             if field not in organization_data:
-                logging.error(f"Missing mandatory field in organizationData: {field}")
-                return func.HttpResponse(
-                    json.dumps({"error": f"Missing mandatory field in organizationData: {field}"}),
-                    status_code=400,
-                    mimetype="application/json"
-                )
+                return func.HttpResponse(f"Missing mandatory field in organizationData: {field}", status_code=400)
 
         for field in mandatory_cam_fields:
             if field not in camera_data:
-                logging.error(f"Missing mandatory field in cameraData: {field}")
-                return func.HttpResponse(
-                    json.dumps({"error": f"Missing mandatory field in cameraData: {field}"}),
-                    status_code=400,
-                    mimetype="application/json"
-                )
+                return func.HttpResponse(f"Missing mandatory field in cameraData: {field}", status_code=400)
 
         # Upsert (Insert or Update) organization data
         organization_container_name.upsert_item(organization_data)
-        logging.info(f"Organization data updated: {organization_data['organizationId']}")
 
         # Upsert (Insert or Update) camera data
         camera_urls_container.upsert_item(camera_data)
-        logging.info(f"Camera data updated for organizationId: {camera_data['organizationId']}")
 
-        return func.HttpResponse(
-            json.dumps({"message": "Organization and camera data updated successfully"}),
-            status_code=200,
-            mimetype="application/json"
-        )
+        return func.HttpResponse("Organization and camera data updated successfully", status_code=200)
 
     except exceptions.CosmosHttpResponseError as e:
-        logging.error(f"Cosmos DB Error: {str(e)}")
-        return func.HttpResponse(
-            json.dumps({"error": f"Cosmos DB Error: {str(e)}"}),
-            status_code=500,
-            mimetype="application/json"
+        return func.HttpResponse(f"Cosmos DB Error: {str(e)}", status_code=500)
+    except Exception as e:
+        return func.HttpResponse(f"Error: {str(e)}", status_code=500)
+
+
+
+
+GRAPH_API_URL = "https://graph.microsoft.com/v1.0"
+GRAPH_SCOPE = "https://graph.microsoft.com/.default"
+
+
+
+
+
+def get_graph_access_token():
+    """Authenticate and get access token for Microsoft Graph."""
+    try:
+        logging.info(f"TENANT_ID: {TENANT_ID}, CLIENT_ID: {CLIENT_ID}, CLIENT_SECRET: {CLIENT_SECRET}, GRAPH_SCOPE: {GRAPH_SCOPE}")
+        credential = ClientSecretCredential(TENANT_ID, CLIENT_ID, CLIENT_SECRET)
+        token = credential.get_token(GRAPH_SCOPE)
+        logging.info("Access token fetched successfully.")
+        return token.token
+    except Exception as e:
+        logging.error(f"Error getting access token: {e}")
+        raise
+
+
+
+def get_user_data(object_id, token):
+    """Fetch user data from Microsoft Graph."""
+    try:
+        url = f"{GRAPH_API_URL}/users/{object_id}"
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.HTTPError as err:
+        logging.error(f"Failed to fetch user data: {err}")
+        raise
+
+
+def update_user_job_title(object_id, job_title, token):
+    """Update user jobTitle in Azure AD B2C."""
+    try:
+        url = f"{GRAPH_API_URL}/users/{object_id}"
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        payload = {"jobTitle": job_title}
+        response = requests.patch(url, headers=headers, data=json.dumps(payload))
+        response.raise_for_status()
+        logging.info(f"Successfully updated job title for user {object_id} to '{job_title}'")
+        return response.status_code == 204
+    except requests.exceptions.HTTPError as err:
+        logging.error(f"Failed to update user job title: {err}")
+        raise
+
+
+
+@app.function_name(name="AssignAdminJobTitle")
+@app.route(route="assign-admin-job-title", methods=[func.HttpMethod.POST])
+async def assign_admin_job_title(req: func.HttpRequest) -> func.HttpResponse:
+    """Handle admin job title assignment with improved performance and reliability."""
+    # Always prepare a valid B2C response
+    b2c_response = {
+        "version": "1.0.0",
+        "action": "Continue",
+        "jobTitle": "admin"
+    }
+    
+    try:
+        # Extract object ID with minimal processing
+        body = req.get_json()
+        object_id = body.get("oid")
+
+        if not object_id:
+            logging.warning("Missing oid in request, returning default response")
+            return func.HttpResponse(json.dumps(b2c_response), 
+                                    status_code=200, 
+                                    mimetype="application/json")
+
+        # Start a background task to update the job title
+        # This allows B2C to continue without waiting for the update to complete
+        background_task = asyncio.create_task(
+            update_job_title_background(object_id, "admin")
         )
+        
+        # Return immediately with the response B2C needs
+        logging.info(f"Returning response to B2C: {b2c_response}")
+        return func.HttpResponse(json.dumps(b2c_response), 
+                                status_code=200, 
+                                mimetype="application/json")
 
     except Exception as e:
-        logging.error(f"Unexpected error: {str(e)}")
-        return func.HttpResponse(
-            json.dumps({"error": "Internal server error"}),
-            status_code=500,
-            mimetype="application/json"
+        logging.error(f"Error in assign_admin_job_title: {str(e)}")
+        # Always return a valid response for B2C
+        return func.HttpResponse(json.dumps(b2c_response), 
+                                status_code=200, 
+                                mimetype="application/json")
+
+async def update_job_title_background(object_id, job_title):
+    """Update job title in the background after responding to B2C."""
+    try:
+        token = get_graph_access_token()
+        if not token:
+            logging.error("Failed to get access token for background update")
+            return
+            
+        user_data = get_user_data(object_id, token)
+        if not user_data:
+            logging.error(f"Failed to get user data for {object_id}")
+            return
+            
+        if not user_data.get("jobTitle"):
+            update_success = update_user_job_title(object_id, job_title, token)
+            if update_success:
+                logging.info(f"Job title updated successfully for {object_id}")
+            else:
+                logging.warning(f"Failed to update job title for {object_id}")
+    except Exception as e:
+        logging.error(f"Error in background job title update: {str(e)}")
+
+
+@app.function_name(name="AssignEmployeeJobTitle")
+@app.route(route="assign-employee-job-title", methods=[func.HttpMethod.POST])
+async def assign_employee_job_title(req: func.HttpRequest) -> func.HttpResponse:
+    """Handle employee job title assignment with improved performance and reliability."""
+    # Always prepare a valid B2C response
+    b2c_response = {
+        "version": "1.0.0",
+        "action": "Continue",
+        "jobTitle": "employee"
+    }
+    
+    try:
+        # Extract object ID with minimal processing
+        body = req.get_json()
+        object_id = body.get("oid")
+
+        if not object_id:
+            logging.warning("Missing oid in request, returning default response")
+            return func.HttpResponse(json.dumps(b2c_response), 
+                                    status_code=200, 
+                                    mimetype="application/json")
+
+        # Start a background task to update the job title
+        # This allows B2C to continue without waiting for the update to complete
+        background_task = asyncio.create_task(
+            update_job_title_background(object_id, "employee")
         )
- 
+        
+        # Return immediately with the response B2C needs
+        logging.info(f"Returning response to B2C: {b2c_response}")
+        return func.HttpResponse(json.dumps(b2c_response), 
+                                status_code=200, 
+                                mimetype="application/json")
+
+    except Exception as e:
+        logging.error(f"Error in assign_employee_job_title: {str(e)}")
+        # Always return a valid response for B2C
+        return func.HttpResponse(json.dumps(b2c_response), 
+                                status_code=200, 
+                                mimetype="application/json")
+
+async def update_job_title_background(object_id, job_title):
+    """Update job title in the background after responding to B2C."""
+    try:
+        token = get_graph_access_token()
+        if not token:
+            logging.error("Failed to get access token for background update")
+            return
+            
+        user_data = get_user_data(object_id, token)
+        if not user_data:
+            logging.error(f"Failed to get user data for {object_id}")
+            return
+            
+        if not user_data.get("jobTitle"):
+            update_success = update_user_job_title(object_id, job_title, token)
+            if update_success:
+                logging.info(f"Job title updated successfully for {object_id}")
+            else:
+                logging.warning(f"Failed to update job title for {object_id}")
+    except Exception as e:
+        logging.error(f"Error in background job title update: {str(e)}")
