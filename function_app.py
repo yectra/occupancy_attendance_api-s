@@ -147,11 +147,16 @@ def decode_jwt(token: str):
             issuer=B2C_ISSUER
         )
 
-        # Log the expected vs actual issuer
-        logging.info(f"Expected Issuer: {B2C_ISSUER}")
-        logging.info(f"Actual Issuer in Token: {decoded_token.get('iss')}")
+         # Log token issue time (iat) and current UTC time
+        issue_time = datetime.utcfromtimestamp(decoded_token['iat'])
+        current_time = datetime.utcnow()
+        logging.info(f"Token issued at (iat): {issue_time}, Current UTC time: {current_time}")
+
+        if issue_time > current_time:
+            logging.warning(f"Token iat is in the future! Possible time sync issue.")
 
         return decoded_token
+        
 
     except InvalidTokenError as e:
         logging.error(f"Token validation error: {str(e)}")
@@ -607,7 +612,9 @@ async def add_employee(req: func.HttpRequest) -> func.HttpResponse:
             'role': role,
             'email': email,
             'imageUrl': image_url,
-            'organizationId': organization_id  # Map employee to the organization
+            'organizationId': organization_id,  # Map employee to the organization
+            'userId':organization_id
+
         }
 
         # Save the employee record in Cosmos DB
@@ -705,7 +712,7 @@ async def update_employee(req: func.HttpRequest) -> func.HttpResponse:
 
         # Define the allowed fields
         allowed_fields = {
-            "employeeName", "role", "email", "organizationId"
+            "employeeName", "role", "email", "organizationId", "userId"
         }
         # Remove protected fields from the update data
         protected_fields = {'id', '_rid', '_self', '_etag', '_attachments', '_ts', 'employeeId', 'newImageBase64'}
@@ -1316,10 +1323,20 @@ async def add_organization(req: func.HttpRequest) -> func.HttpResponse:
         website_url = json_data.get('websiteUrl')
         domain_name = json_data.get('domainName')
         address = json_data.get('address')
+        work_timing = json_data.get('workTiming', 8)  # Default to 8 hours
 
+        # Validate required fields
         if not organization_name:
             return func.HttpResponse(
                 json.dumps({'error': 'Organization name is mandatory'}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        # Validate workTiming
+        if not isinstance(work_timing, (int, float)) or work_timing <= 0:
+            return func.HttpResponse(
+                json.dumps({'error': 'Invalid workTiming. Must be a positive number.'}),
                 status_code=400,
                 mimetype="application/json"
             )
@@ -1366,6 +1383,7 @@ async def add_organization(req: func.HttpRequest) -> func.HttpResponse:
             'websiteUrl': website_url,
             'domainName': domain_name,
             'address': address,
+            'workTiming': work_timing, 
             'createdAt': datetime.utcnow().isoformat(),
         }
 
@@ -1385,6 +1403,7 @@ async def add_organization(req: func.HttpRequest) -> func.HttpResponse:
             status_code=500,
             mimetype="application/json"
         )
+
 
 
 
@@ -2473,3 +2492,57 @@ async def update_job_title_background(object_id, job_title):
                 logging.warning(f"Failed to update job title for {object_id}")
     except Exception as e:
         logging.error(f"Error in background job title update: {str(e)}")
+
+
+
+
+# Get individual user by sub ID (userId)
+@app.function_name(name="get_user_attendance")
+@app.route(route='api/attendance', methods=[func.HttpMethod.GET])
+@require_auth
+async def get_user_attendance(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        # Extract userId from token (sub claim)
+        user_id = req.user_info.get('sub')
+
+        if not user_id:
+            logging.error("Invalid token: userId (sub) missing")
+            return func.HttpResponse(
+                json.dumps({"error": "Invalid token: userId (sub) missing"}),
+                status_code=401,
+                mimetype="application/json"
+            )
+
+        # Fetch attendance records for the user
+        query = "SELECT * FROM c WHERE c.userId = @userId"
+        parameters = [{"name": "@userId", "value": user_id}]
+
+        user_attendance = list(attendance_container.query_items(
+            query=query,
+            parameters=parameters,
+            enable_cross_partition_query=True
+        ))
+
+        if not user_attendance:
+            logging.warning(f"No attendance found for userId: {user_id}")
+            return func.HttpResponse(
+                json.dumps({"message": "No attendance records found for this user."}),
+                status_code=404,
+                mimetype="application/json"
+            )
+
+        return func.HttpResponse(
+            json.dumps(user_attendance),
+            status_code=200,
+            mimetype="application/json"
+        )
+
+    except Exception as e:
+        logging.error(f"Error fetching attendance for userId {user_id}: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"error": "Internal server error"}),
+            status_code=500,
+            mimetype="application/json"
+        )
+
+
