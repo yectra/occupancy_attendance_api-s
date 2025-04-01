@@ -2,6 +2,8 @@ import asyncio
 import functools
 import json
 import logging
+import random
+import string
 from natsort import natsorted
 from dotenv import load_dotenv
 from azure.cosmos import CosmosClient, exceptions 
@@ -26,9 +28,7 @@ from functools import lru_cache, wraps
 import logging
 import json
 import os
-import jwt
 from jwt.exceptions import InvalidTokenError
-import requests
 import azure.functions as func
 from typing import Dict, Any, Callable
 from collections import defaultdict
@@ -71,10 +71,10 @@ TENANT_NAME = os.getenv('AZURE_B2C_TENANT_NAME')
 POLICY_NAME = os.getenv('AZURE_B2C_POLICY_NAME')
 CLIENT_ID = os.getenv('AZURE_B2C_CLIENT_ID')
 TENANT_ID = os.getenv("AZURE_B2C_TENANT_ID")
-CLIENT_ID = os.getenv("AZURE_B2C_CLIENT_ID")
 CLIENT_SECRET = os.getenv("AZURE_B2C_CLIENT_SECRET")
 USER_COUNTS=os.getenv('USER_COUNTS')
 USER_LOGS=os.getenv('USER_LOGS')
+USERS=os.getenv('USERS')
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)  # Set the logging level to DEBUG
 
@@ -95,6 +95,7 @@ counts_container = database.get_container_client(COUNTS_CONTAINER)
 person_features =database.get_container_client(PERSON_FEATURE_CONTAINER)
 user_counts_container = database.get_container_client(USER_COUNTS)
 user_logs_container = database.get_container_client(USER_LOGS)
+users_container=database.get_container_client(USERS)
 # Initialize the Blob Service Client
 blob_service_client = BlobServiceClient.from_connection_string(BLOB_CONNECTION_STRING)
 blob_container_client = blob_service_client.get_container_client(BLOB_CONTAINER_NAME)
@@ -536,284 +537,293 @@ def delete_image_from_blob(blob_url):
 
 
 
-# # Define the Azure Function for adding an employee      -post
-@app.function_name(name="add_employee")
-@app.route(route='employee', methods=[func.HttpMethod.POST])
-@require_auth
-async def add_employee(req: func.HttpRequest) -> func.HttpResponse:
-    try:
-        logging.info(f"Token validated for user: {req.user_info.get('email', 'unknown')}")
-        logging.info(f"User Info: {req.user_info}")  # Debugging log
+# # Allowed image formats
+# ALLOWED_IMAGE_FORMATS = ('.jpg', '.jpeg', '.png', '.bmp')
 
-        # Extract JSON data from the request body
-        json_data = req.get_json()
+# @app.function_name(name="add_employee")
+# @app.route(route='employee', methods=[func.HttpMethod.POST])
+# @require_auth
+# async def add_employee(req: func.HttpRequest) -> func.HttpResponse:
+#     try:
+#         logging.info(f"Token validated for user: {req.user_info.get('email', 'unknown')}")
+#         logging.info(f"User Info: {req.user_info}")
 
-        if not json_data:
-            return func.HttpResponse(
-                body=json.dumps({'error': 'JSON data is required in the request body'}),
-                status_code=400,
-                mimetype="application/json"
-            )
+#         # Extract JSON data from the request body
+#         json_data = req.get_json()
 
-        # Extract fields from the JSON data
-        employee_id = json_data.get('employeeId')
-        name = json_data.get('employeeName')
-        role = json_data.get('role')
-        email = json_data.get('email')
-        base64_image = json_data.get('imageBase64')  # Base64-encoded image
-    
+#         if not json_data:
+#             return func.HttpResponse(
+#                 body=json.dumps({'error': 'JSON data is required in the request body'}),
+#                 status_code=400,
+#                 mimetype="application/json"
+#             )
 
-        # Check if required fields are provided
-        if not employee_id or not name or not role or not email:
-            return func.HttpResponse(
-                body=json.dumps({'error': 'All fields except image are required'}),
-                status_code=400,
-                mimetype="application/json"
-            )
+#         # Extract fields from the JSON data
+#         employee_id = json_data.get('employeeId')
+#         name = json_data.get('employeeName')
+#         role = json_data.get('role')
+#         email = json_data.get('email')
+#         image_name = json_data.get('imageName')  # Image file name with extension
 
-        # Validate email format using regex
-        EMAIL_REGEX = r'^[a-zA-Z0-9._%+-]+@[a-zAZ0-9.-]+\.[a-zA-Z]{2,}$'
-        if not re.match(EMAIL_REGEX, email):
-            return func.HttpResponse(
-                body=json.dumps({'error': 'Invalid email format'}),
-                status_code=400,
-                mimetype="application/json"
-            )
+#         # Check if required fields are provided
+#         if not employee_id or not name or not role or not email:
+#             return func.HttpResponse(
+#                 body=json.dumps({'error': 'All fields except image are required'}),
+#                 status_code=400,
+#                 mimetype="application/json"
+#             )
 
-        # Get `organizationId` from token (same as `sub`)
-        organization_id = req.user_info.get('user_id')  # Fix applied here
+#         # Validate email format using regex
+#         EMAIL_REGEX = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+#         if not re.match(EMAIL_REGEX, email):
+#             return func.HttpResponse(
+#                 body=json.dumps({'error': 'Invalid email format'}),
+#                 status_code=400,
+#                 mimetype="application/json"
+#             )
 
-        if not organization_id:
-            return func.HttpResponse(
-                body=json.dumps({'error': 'Invalid token: organizationId (sub) missing'}),
-                status_code=401,
-                mimetype="application/json"
-            )
+#         # Validate image format if image is provided
+#         if image_name:
+#             if not image_name.lower().endswith(ALLOWED_IMAGE_FORMATS):
+#                 return func.HttpResponse(
+#                     body=json.dumps({'error': f'Invalid image format. Allowed formats: {ALLOWED_IMAGE_FORMATS}'}),
+#                     status_code=400,
+#                     mimetype="application/json"
+#                 )
 
-        # Check if employeeId already exists in Cosmos DB
-        query = f"SELECT * FROM c WHERE c.employeeId = '{employee_id}'"
-        existing_employees = list(employee_container.query_items(query=query, enable_cross_partition_query=True))
+#         # Get `organizationId` from token (same as `sub`)
+#         organization_id = req.user_info.get('user_id')
 
-        if existing_employees:
-            return func.HttpResponse(
-                body=json.dumps({'Warn': f'Employee with employeeId {employee_id} already exists'}),
-                status_code=409,  # Conflict status code
-                mimetype="application/json"
-            )
+#         if not organization_id:
+#             return func.HttpResponse(
+#                 body=json.dumps({'error': 'Invalid token: organizationId (sub) missing'}),
+#                 status_code=401,
+#                 mimetype="application/json"
+#             )
 
-        # Upload the image if provided
-        image_url = upload_image_to_blob(base64_image, employee_id) if base64_image else None
+#         # Check if employeeId already exists in Cosmos DB
+#         query = f"SELECT * FROM c WHERE c.employeeId = '{employee_id}'"
+#         existing_employees = list(employee_container.query_items(query=query, enable_cross_partition_query=True))
 
-        # Create the employee record
-        employee_record = {
-            'id': str(uuid.uuid4()),
-            'employeeId': employee_id,
-            'employeeName': name,
-            'role': role,
-            'email': email,
-            'imageUrl': image_url,
-            'organizationId': organization_id,  # Map employee to the organization
-            'userId':organization_id
+#         if existing_employees:
+#             return func.HttpResponse(
+#                 body=json.dumps({'Warn': f'Employee with employeeId {employee_id} already exists'}),
+#                 status_code=409,  # Conflict status code
+#                 mimetype="application/json"
+#             )
 
-        }
+#         # Upload the image if provided (assuming upload_image_to_blob handles it)
+#         image_url = upload_image_to_blob(json_data.get('imageBase64'), employee_id) if json_data.get('imageBase64') else None
 
-        # Save the employee record in Cosmos DB
-        employee_container.create_item(body=employee_record)
+#         # Create the employee record
+#         employee_record = {
+#             'id': str(uuid.uuid4()),
+#             'employeeId': employee_id,
+#             'employeeName': name,
+#             'role': role,
+#             'email': email,
+#             'imageUrl': image_url,
+#             'organizationId': organization_id,
+#             'userId': organization_id
+#         }
 
-        return func.HttpResponse(
-            body=json.dumps({'message': 'Employee added successfully', 'data': employee_record}),
-            status_code=201,
-            mimetype="application/json"
-        )
+#         # Save the employee record in Cosmos DB
+#         employee_container.create_item(body=employee_record)
 
-    except Exception as e:
-        logging.error(f"Error adding employee: {str(e)}")
-        return func.HttpResponse(
-            body=json.dumps({'error': str(e)}),
-            status_code=500,
-            mimetype="application/json"
-        )
+#         return func.HttpResponse(
+#             body=json.dumps({'message': 'Employee added successfully', 'data': employee_record}),
+#             status_code=201,
+#             mimetype="application/json"
+#         )
+
+#     except Exception as e:
+#         logging.error(f"Error adding employee: {str(e)}")
+#         return func.HttpResponse(
+#             body=json.dumps({'error': str(e)}),
+#             status_code=500,
+#             mimetype="application/json"
+#         )
 
 
 
                                                     # put function
-# Update Employee function (for PUT requests)
-@app.function_name(name="update_employee")
-@app.route(route="update-employee/{employee_id}", methods=[func.HttpMethod.PUT])
-@require_auth
-async def update_employee(req: func.HttpRequest) -> func.HttpResponse:
-    logging.info(f"Token validated for user: {req.user_info.get('email', 'unknown')}")
-    logging.info('Processing update employee request.')
+# #Update Employee function (for PUT requests)
+# @app.function_name(name="update_employee")
+# @app.route(route="update-employee/{employee_id}", methods=[func.HttpMethod.PUT])
+# @require_auth
+# async def update_employee(req: func.HttpRequest) -> func.HttpResponse:
+#     logging.info(f"Token validated for user: {req.user_info.get('email', 'unknown')}")
+#     logging.info('Processing update employee request.')
 
-    try:
-        # Get employee ID from the route and validate
-        employee_id = str(req.route_params.get('employee_id'))
-        if not employee_id:
-            return func.HttpResponse(
-                json.dumps({'warn': 'Employee ID is required'}), 
-                status_code=400, 
-                mimetype="application/json"
-            )
+#     try:
+#         # Get employee ID from the route and validate
+#         employee_id = str(req.route_params.get('employee_id'))
+#         if not employee_id:
+#             return func.HttpResponse(
+#                 json.dumps({'warn': 'Employee ID is required'}), 
+#                 status_code=400, 
+#                 mimetype="application/json"
+#             )
 
-        # Parse request body to get the update data
-        try:
-            data = req.get_json()
-        except ValueError:
-            return func.HttpResponse(
-                json.dumps({'error': 'Invalid JSON in request body'}), 
-                status_code=400, 
-                mimetype="application/json"
-            )
+#         # Parse request body to get the update data
+#         try:
+#             data = req.get_json()
+#         except ValueError:
+#             return func.HttpResponse(
+#                 json.dumps({'error': 'Invalid JSON in request body'}), 
+#                 status_code=400, 
+#                 mimetype="application/json"
+#             )
 
-        logging.info(f"Processing update for employee ID: {employee_id}")
+#         logging.info(f"Processing update for employee ID: {employee_id}")
 
-        # Fetch the existing employee record from Cosmos DB
-        query = "SELECT * FROM c WHERE c.employeeId = @employeeId"
-        parameters = [{"name": "@employeeId", "value": employee_id}]
-        items = list(employee_container.query_items(
-            query=query,
-            parameters=parameters,
-            enable_cross_partition_query=True
-        ))
+#         # Fetch the existing employee record from Cosmos DB
+#         query = "SELECT * FROM c WHERE c.employeeId = @employeeId"
+#         parameters = [{"name": "@employeeId", "value": employee_id}]
+#         items = list(employee_container.query_items(
+#             query=query,
+#             parameters=parameters,
+#             enable_cross_partition_query=True
+#         ))
 
-        if not items:
-            return func.HttpResponse(
-                json.dumps({'error': 'Employee not found'}), 
-                status_code=404, 
-                mimetype="application/json"
-            )
+#         if not items:
+#             return func.HttpResponse(
+#                 json.dumps({'error': 'Employee not found'}), 
+#                 status_code=404, 
+#                 mimetype="application/json"
+#             )
 
-        item = items[0]  # Existing employee record
+#         item = items[0]  # Existing employee record
 
-        # Handle image upload if new image is provided
-        new_image_base64 = data.get('newImageBase64')
-        if new_image_base64:  # Only process if a new image is provided
-            try:
-                # Upload the new image and get its URL
-                new_image_url = upload_image_to_blob(new_image_base64, employee_id)
+#         # Handle image upload if new image is provided
+#         new_image_base64 = data.get('newImageBase64')
+#         if new_image_base64:  # Only process if a new image is provided
+#             try:
+#                 # Upload the new image and get its URL
+#                 new_image_url = upload_image_to_blob(new_image_base64, employee_id)
 
-                if new_image_url:
-                    # If there was a previous image, delete it
-                    if item.get('imageUrl'):
-                        delete_image_from_blob(item['imageUrl'])
+#                 if new_image_url:
+#                     # If there was a previous image, delete it
+#                     if item.get('imageUrl'):
+#                         delete_image_from_blob(item['imageUrl'])
 
-                    # Update the image URL in the employee record
-                    item['imageUrl'] = new_image_url
-                    logging.info(f"Updated image URL for employee {employee_id}: {new_image_url}")
-            except Exception as e:
-                logging.error(f"Error handling image upload: {e}")
-                return func.HttpResponse(
-                    json.dumps({'error': f'Error processing image: {str(e)}'}), 
-                    status_code=500, 
-                    mimetype="application/json"
-                )
-        else:
-            logging.info(f"No new image provided. Keeping existing image URL: {item.get('imageUrl')}")
+#                     # Update the image URL in the employee record
+#                     item['imageUrl'] = new_image_url
+#                     logging.info(f"Updated image URL for employee {employee_id}: {new_image_url}")
+#             except Exception as e:
+#                 logging.error(f"Error handling image upload: {e}")
+#                 return func.HttpResponse(
+#                     json.dumps({'error': f'Error processing image: {str(e)}'}), 
+#                     status_code=500, 
+#                     mimetype="application/json"
+#                 )
+#         else:
+#             logging.info(f"No new image provided. Keeping existing image URL: {item.get('imageUrl')}")
 
-        # Define the allowed fields
-        allowed_fields = {
-            "employeeName", "role", "email", "organizationId", "userId"
-        }
-        # Remove protected fields from the update data
-        protected_fields = {'id', '_rid', '_self', '_etag', '_attachments', '_ts', 'employeeId', 'newImageBase64'}
-        update_data = {k: v for k, v in data.items() if k in allowed_fields and k not in protected_fields}
+#         # Define the allowed fields
+#         allowed_fields = {
+#             "employeeName", "role", "email", "organizationId", "userId"
+#         }
+#         # Remove protected fields from the update data
+#         protected_fields = {'id', '_rid', '_self', '_etag', '_attachments', '_ts', 'employeeId', 'newImageBase64'}
+#         update_data = {k: v for k, v in data.items() if k in allowed_fields and k not in protected_fields}
 
-        # Update the existing employee record with new data
-        item.update(update_data)
+#         # Update the existing employee record with new data
+#         item.update(update_data)
 
-        # Replace the employee record in Cosmos DB
-        try:
-            employee_container.replace_item(
-                item=item['id'],
-                body=item
-            )
-            logging.info(f"Employee {employee_id} updated successfully.")
-        except exceptions.CosmosHttpResponseError as e:
-            logging.error(f"Error updating employee in Cosmos DB: {e}")
+#         # Replace the employee record in Cosmos DB
+#         try:
+#             employee_container.replace_item(
+#                 item=item['id'],
+#                 body=item
+#             )
+#             logging.info(f"Employee {employee_id} updated successfully.")
+#         except exceptions.CosmosHttpResponseError as e:
+#             logging.error(f"Error updating employee in Cosmos DB: {e}")
 
-            # Clean up the newly uploaded image in case of an error
-            if new_image_base64 and 'new_image_url' in locals():
-                delete_image_from_blob(new_image_url)
+#             # Clean up the newly uploaded image in case of an error
+#             if new_image_base64 and 'new_image_url' in locals():
+#                 delete_image_from_blob(new_image_url)
 
-            return func.HttpResponse(
-                json.dumps({'error': 'Failed to update employee record'}), 
-                status_code=500, 
-                mimetype="application/json"
-            )
+#             return func.HttpResponse(
+#                 json.dumps({'error': 'Failed to update employee record'}), 
+#                 status_code=500, 
+#                 mimetype="application/json"
+#             )
 
-        # Return the updated employee data as the response
-        return func.HttpResponse(
-            json.dumps({
-                'message': 'Employee updated successfully',
-                'data': item
-            }),
-            status_code=200,
-            mimetype="application/json"
-        )
+#         # Return the updated employee data as the response
+#         return func.HttpResponse(
+#             json.dumps({
+#                 'message': 'Employee updated successfully',
+#                 'data': item
+#             }),
+#             status_code=200,
+#             mimetype="application/json"
+#         )
 
-    except Exception as e:
-        logging.error(f"Unexpected error in update_employee: {e}")
-        return func.HttpResponse(
-            json.dumps({'error': str(e)}),
-            status_code=500,
-            mimetype="application/json"
-        )
+#     except Exception as e:
+#         logging.error(f"Unexpected error in update_employee: {e}")
+#         return func.HttpResponse(
+#             json.dumps({'error': str(e)}),
+#             status_code=500,
+#             mimetype="application/json"
+#         )
 
 
     
                     # Define the Azure Function for delete an employee
 
-@app.function_name(name="delete_employee")
-@app.route(route="employee/{employee_id}", methods=[func.HttpMethod.DELETE])
-def delete_employee(req: func.HttpRequest) -> func.HttpResponse:
-    # Validate and decode the token
-    try:
-        user_info = validate_and_decode_token(req)
-        logging.info(f"Token validated for user: {user_info.get('email', 'unknown')}")
-    except Exception as e:
-        logging.error(f"Unauthorized Request: {str(e)}")
-        return func.HttpResponse(
-            json.dumps({"error": "Unauthorized: Missing or Invalid Token"}),
-            status_code=401,
-            mimetype="application/json"
-        )
+# @app.function_name(name="delete_employee")
+# @app.route(route="employee/{employee_id}", methods=[func.HttpMethod.DELETE])
+# def delete_employee(req: func.HttpRequest) -> func.HttpResponse:
+#     # Validate and decode the token
+#     try:
+#         user_info = validate_and_decode_token(req)
+#         logging.info(f"Token validated for user: {user_info.get('email', 'unknown')}")
+#     except Exception as e:
+#         logging.error(f"Unauthorized Request: {str(e)}")
+#         return func.HttpResponse(
+#             json.dumps({"error": "Unauthorized: Missing or Invalid Token"}),
+#             status_code=401,
+#             mimetype="application/json"
+#         )
 
-    logging.info('Processing delete employee request.')
+#     logging.info('Processing delete employee request.')
 
-    try:
-        # Get the employee ID from the route parameters
-        employee_id = req.route_params.get('employee_id')
+#     try:
+#         # Get the employee ID from the route parameters
+#         employee_id = req.route_params.get('employee_id')
 
-        # Query to fetch the employee record by id
-        query = f"SELECT * FROM c WHERE c.employeeId = '{employee_id}'"
-        logging.info(f"Query: {query}")
-        items = list(employee_container.query_items(query=query, enable_cross_partition_query=True))
-        logging.info(f"Items found: {items}")
+#         # Query to fetch the employee record by id
+#         query = f"SELECT * FROM c WHERE c.employeeId = '{employee_id}'"
+#         logging.info(f"Query: {query}")
+#         items = list(employee_container.query_items(query=query, enable_cross_partition_query=True))
+#         logging.info(f"Items found: {items}")
 
-        if items:
-            item = items[0]  # Get the first (and expected only) result
+#         if items:
+#             item = items[0]  # Get the first (and expected only) result
 
-            # Delete the employee record from Cosmos DB
-            # Use the partition key and document id for deletion
-            employee_container.delete_item(item=item['id'], partition_key=item['id'])
-            return func.HttpResponse(
-                body=json.dumps({'message': 'Employee deleted successfully'}),
-                status_code=200,
-                mimetype="application/json"
-            )
+#             # Delete the employee record from Cosmos DB
+#             # Use the partition key and document id for deletion
+#             employee_container.delete_item(item=item['id'], partition_key=item['id'])
+#             return func.HttpResponse(
+#                 body=json.dumps({'message': 'Employee deleted successfully'}),
+#                 status_code=200,
+#                 mimetype="application/json"
+#             )
 
-        return func.HttpResponse(
-            body=json.dumps({'message': 'Employee not found'}),
-            status_code=404,
-            mimetype="application/json"
-        )
-    except Exception as e:
-        logging.error(f"Error deleting employee: {str(e)}")
-        return func.HttpResponse(
-            body=json.dumps({'error': str(e)}),
-            status_code=500,
-            mimetype="application/json"
-        )
+#         return func.HttpResponse(
+#             body=json.dumps({'message': 'Employee not found'}),
+#             status_code=404,
+#             mimetype="application/json"
+#         )
+#     except Exception as e:
+#         logging.error(f"Error deleting employee: {str(e)}")
+#         return func.HttpResponse(
+#             body=json.dumps({'error': str(e)}),
+#             status_code=500,
+#             mimetype="application/json"
+#         )
 
     
 
@@ -1051,18 +1061,18 @@ def get_camera_data_by_id(camera_id: str):
         logging.error(f"Error retrieving camera data: {str(e)}")
         return None
 
-# attendance camera
 @app.function_name(name="saveattendanceCameraUrl")
 @app.route(route='api/cameraUrl', methods=[func.HttpMethod.POST])
 @require_auth
 async def saveCameraUrls(req: func.HttpRequest) -> func.HttpResponse:
+    EMAIL_REGEX = r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$"
+    ALLOWED_URL_SCHEMES = {"http", "https", "rtsp"}
+
     try:
         logging.info(f"Token validated for user: {req.user_info.get('email', 'unknown')}")
-        logging.info(f"User Info: {req.user_info}")  # Debugging log
 
         # Extract organizationId (same as sub/user_id)
         organization_id = req.user_info.get('user_id')
-
         if not organization_id:
             return func.HttpResponse(
                 json.dumps({'error': 'Invalid token: organizationId (sub) missing'}),
@@ -1073,49 +1083,68 @@ async def saveCameraUrls(req: func.HttpRequest) -> func.HttpResponse:
         # Parse the incoming JSON data
         req_body = req.get_json()
 
-        # Extract email from request body or fallback to req.user_info
+        # Extract and validate email
         email = req_body.get("email") or req.user_info.get("email", "")
-
-        # Ensure email is not empty
-        if not email:
+        if not email or not re.match(EMAIL_REGEX, email):
             return func.HttpResponse(
-                json.dumps({"error": "Email is missing in both request body and token."}),
+                json.dumps({"error": "Invalid email format."}),
                 status_code=400
             )
 
-        # Extract and validate `cameraDetails1`
-        camera_details = req_body.get("cameraDetails", [])
-        if not camera_details or not isinstance(camera_details, list):
+        # Extract and validate `cameraDetails`
+        new_camera_details = req_body.get("cameraDetails", [])
+        if not new_camera_details or not isinstance(new_camera_details, list):
             return func.HttpResponse(
                 json.dumps({"detail": "Missing or invalid field: 'cameraDetails'."}),
                 status_code=400
             )
 
+        # Query existing records for the organization
+        query = f"SELECT * FROM c WHERE c.organizationId = '{organization_id}'"
+        existing_records = list(camera_urls_container.query_items(query=query, enable_cross_partition_query=True))
+
+        # Determine next cameraId
+        existing_camera_ids = []
+        if existing_records:
+            for record in existing_records:
+                existing_camera_ids.extend([cam.get("cameraId", 0) for cam in record.get("cameraDetails", [])])
+
+        next_camera_id = max(existing_camera_ids, default=0) + 1  # Increment the highest cameraId
+
         validated_camera_details = []
-        for detail in camera_details:
-            if not all(key in detail for key in ["punchinCamera", "punchinUrl", "punchoutCamera", "punchoutUrl"]):
+        for detail in new_camera_details:
+            required_keys = ["punchinCamera", "punchinUrl", "punchoutCamera", "punchoutUrl"]
+            if not all(key in detail for key in required_keys):
                 return func.HttpResponse(
-                    json.dumps({"detail": "Each item in 'cameraDetails' must contain 'punchinCamera', 'punchinUrl', 'punchoutCamera', and 'punchoutUrl'."}),
+                    json.dumps({"detail": f"Each item in 'cameraDetails' must contain {required_keys}."}),
                     status_code=400
                 )
 
+            # Validate punch-in and punch-out URLs
+            for key in ["punchinUrl", "punchoutUrl"]:
+                url = detail[key]
+                if not any(url.startswith(scheme + "://") for scheme in ALLOWED_URL_SCHEMES):
+                    return func.HttpResponse(
+                        json.dumps({"error": f"Invalid {key} format. Allowed formats: {', '.join(ALLOWED_URL_SCHEMES)}."}),
+                        status_code=400
+                    )
+
             validated_camera_details.append({
+                "cameraId": next_camera_id,
                 "punchinCamera": detail["punchinCamera"],
                 "punchinUrl": detail["punchinUrl"],
                 "punchoutCamera": detail["punchoutCamera"],
                 "punchoutUrl": detail["punchoutUrl"]
             })
-
-        # Check if a record already exists for this organization
-        query = f"SELECT * FROM c WHERE c.organizationId = '{organization_id}'"
-        existing_records = list(camera_urls_container.query_items(query=query, enable_cross_partition_query=True))
+            next_camera_id += 1  # Increment for each new camera
 
         if existing_records:
-            # Update the existing record
+            # Update the existing record - Append new camera details
             existing_record = existing_records[0]
             existing_record["email"] = email  # Update email at root level
-            existing_record["cameraDetails"] = validated_camera_details
-            upsert_camera_urls(existing_record)  # Update record in Cosmos DB
+            existing_record["cameraDetails"].extend(validated_camera_details)  # Append new cameras
+
+            upsert_camera_urls(existing_record)
             response_message = {"message": "Camera URLs updated successfully.", "id": existing_record["id"]}
         else:
             # Insert new record with `organizationId`
@@ -1126,7 +1155,7 @@ async def saveCameraUrls(req: func.HttpRequest) -> func.HttpResponse:
                 "email": email,  # Store email at root level
                 "cameraDetails": validated_camera_details
             }
-            upsert_camera_urls(camera_data)  # Insert new record into Cosmos DB
+            upsert_camera_urls(camera_data)
             response_message = {"message": "Camera URLs saved successfully.", "id": camera_id}
 
         return func.HttpResponse(json.dumps(response_message), status_code=200)
@@ -1300,7 +1329,7 @@ def get_camera_by_id(camera_id):
 
 
 
-# Define the Azure Function for adding an organization - POST
+
 @app.function_name(name="add_organization")
 @app.route(route="organization", methods=[func.HttpMethod.POST])
 @require_auth
@@ -1321,9 +1350,8 @@ async def add_organization(req: func.HttpRequest) -> func.HttpResponse:
         organization_name = json_data.get('organizationName')
         phone_number = json_data.get('phoneNumber')
         website_url = json_data.get('websiteUrl')
-        domain_name = json_data.get('domainName')
         address = json_data.get('address')
-        work_timing = json_data.get('workTiming', 8)  # Default to 8 hours
+        work_timing = json_data.get('workTiming')  # Extract workTiming
 
         # Validate required fields
         if not organization_name:
@@ -1333,10 +1361,21 @@ async def add_organization(req: func.HttpRequest) -> func.HttpResponse:
                 mimetype="application/json"
             )
 
-        # Validate workTiming
-        if not isinstance(work_timing, (int, float)) or work_timing <= 0:
+        # Convert workTiming to an integer if provided
+        try:
+            work_timing = int(work_timing) if work_timing else None
+        except ValueError:
             return func.HttpResponse(
-                json.dumps({'error': 'Invalid workTiming. Must be a positive number.'}),
+                json.dumps({'error': 'workTiming must be a valid integer'}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        # Validate phone number (only digits with optional + at the beginning, 10-15 digits)
+        phone_number_pattern = r'^\+?\d{10,15}$'
+        if phone_number and not re.match(phone_number_pattern, phone_number):
+            return func.HttpResponse(
+                json.dumps({'error': 'Invalid phone number. Must be 10-15 digits, with optional + at the start.'}),
                 status_code=400,
                 mimetype="application/json"
             )
@@ -1376,14 +1415,13 @@ async def add_organization(req: func.HttpRequest) -> func.HttpResponse:
 
         # Create or update organization record
         organization_record = {
-            'id': organization_id,  # Ensure `id` is the `sub` (user_id)
+            'id': organization_id,
             'organizationId': organization_id,
             'organizationName': organization_name,
             'phoneNumber': phone_number,
             'websiteUrl': website_url,
-            'domainName': domain_name,
             'address': address,
-            'workTiming': work_timing, 
+            'workTiming': work_timing,  # Store as an integer
             'createdAt': datetime.utcnow().isoformat(),
         }
 
@@ -2300,6 +2338,13 @@ async def update_organization_camera_data(req: func.HttpRequest) -> func.HttpRes
             if field not in camera_data:
                 return func.HttpResponse(f"Missing mandatory field in cameraData: {field}", status_code=400)
 
+        # Convert workTiming to an integer if it exists
+        if "workTiming" in organization_data:
+            try:
+                organization_data["workTiming"] = int(organization_data["workTiming"])
+            except ValueError:
+                return func.HttpResponse("Invalid workTiming value. Must be a number.", status_code=400)
+
         # Upsert (Insert or Update) organization data
         organization_container_name.upsert_item(organization_data)
 
@@ -2316,187 +2361,294 @@ async def update_organization_camera_data(req: func.HttpRequest) -> func.HttpRes
 
 
 
-GRAPH_API_URL = "https://graph.microsoft.com/v1.0"
-GRAPH_SCOPE = "https://graph.microsoft.com/.default"
+
+# GRAPH_API_URL = "https://graph.microsoft.com/v1.0"
+# GRAPH_SCOPE = "https://graph.microsoft.com/.default"
 
 
 
 
 
-def get_graph_access_token():
-    """Authenticate and get access token for Microsoft Graph."""
-    try:
-        logging.info(f"TENANT_ID: {TENANT_ID}, CLIENT_ID: {CLIENT_ID}, CLIENT_SECRET: {CLIENT_SECRET}, GRAPH_SCOPE: {GRAPH_SCOPE}")
-        credential = ClientSecretCredential(TENANT_ID, CLIENT_ID, CLIENT_SECRET)
-        token = credential.get_token(GRAPH_SCOPE)
-        logging.info("Access token fetched successfully.")
-        return token.token
-    except Exception as e:
-        logging.error(f"Error getting access token: {e}")
-        raise
+# def get_graph_access_token():
+#     """Authenticate and get access token for Microsoft Graph."""
+#     try:
+#         logging.info(f"TENANT_ID: {TENANT_ID}, CLIENT_ID: {CLIENT_ID}, CLIENT_SECRET: {CLIENT_SECRET}, GRAPH_SCOPE: {GRAPH_SCOPE}")
+#         credential = ClientSecretCredential(TENANT_ID, CLIENT_ID, CLIENT_SECRET)
+#         token = credential.get_token(GRAPH_SCOPE)
+#         logging.info("Access token fetched successfully.")
+#         return token.token
+#     except Exception as e:
+#         logging.error(f"Error getting access token: {e}")
+#         raise
 
 
 
-def get_user_data(object_id, token):
-    """Fetch user data from Microsoft Graph."""
-    try:
-        url = f"{GRAPH_API_URL}/users/{object_id}"
-        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-        response = requests.get(url, headers=headers)
-        response.raise_for_status()
-        return response.json()
-    except requests.exceptions.HTTPError as err:
-        logging.error(f"Failed to fetch user data: {err}")
-        raise
+# def get_user_data(object_id, token):
+#     """Fetch user data from Microsoft Graph."""
+#     try:
+#         url = f"{GRAPH_API_URL}/users/{object_id}"
+#         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+#         response = requests.get(url, headers=headers)
+#         response.raise_for_status()
+#         return response.json()
+#     except requests.exceptions.HTTPError as err:
+#         logging.error(f"Failed to fetch user data: {err}")
+#         raise
 
 
-def update_user_job_title(object_id, job_title, token):
-    """Update user jobTitle in Azure AD B2C."""
-    try:
-        url = f"{GRAPH_API_URL}/users/{object_id}"
-        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-        payload = {"jobTitle": job_title}
-        response = requests.patch(url, headers=headers, data=json.dumps(payload))
-        response.raise_for_status()
-        logging.info(f"Successfully updated job title for user {object_id} to '{job_title}'")
-        return response.status_code == 204
-    except requests.exceptions.HTTPError as err:
-        logging.error(f"Failed to update user job title: {err}")
-        raise
+# def update_user_job_title(object_id, job_title, token):
+#     """Update user jobTitle in Azure AD B2C."""
+#     try:
+#         url = f"{GRAPH_API_URL}/users/{object_id}"
+#         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+#         payload = {"jobTitle": job_title}
+#         response = requests.patch(url, headers=headers, data=json.dumps(payload))
+#         response.raise_for_status()
+#         logging.info(f"Successfully updated job title for user {object_id} to '{job_title}'")
+#         return response.status_code == 204
+#     except requests.exceptions.HTTPError as err:
+#         logging.error(f"Failed to update user job title: {err}")
+#         raise
 
 
+
+# @app.function_name(name="AssignAdminJobTitle")
+# @app.route(route="assign-admin-job-title", methods=[func.HttpMethod.POST])
+# async def assign_admin_job_title(req: func.HttpRequest) -> func.HttpResponse:
+#     """Handle admin job title assignment with improved performance and reliability."""
+#     # Always prepare a valid B2C response
+#     b2c_response = {
+#         "version": "1.0.0",
+#         "action": "Continue",
+#         "jobTitle": "admin"
+#     }
+    
+#     try:
+#         # Extract object ID with minimal processing
+#         body = req.get_json()
+#         object_id = body.get("oid")
+
+#         if not object_id:
+#             logging.warning("Missing oid in request, returning default response")
+#             return func.HttpResponse(json.dumps(b2c_response), 
+#                                     status_code=200, 
+#                                     mimetype="application/json")
+
+#         # Start a background task to update the job title
+#         # This allows B2C to continue without waiting for the update to complete
+#         background_task = asyncio.create_task(
+#             update_job_title_background(object_id, "admin")
+#         )
+        
+#         # Return immediately with the response B2C needs
+#         logging.info(f"Returning response to B2C: {b2c_response}")
+#         return func.HttpResponse(json.dumps(b2c_response), 
+#                                 status_code=200, 
+#                                 mimetype="application/json")
+
+#     except Exception as e:
+#         logging.error(f"Error in assign_admin_job_title: {str(e)}")
+#         # Always return a valid response for B2C
+#         return func.HttpResponse(json.dumps(b2c_response), 
+#                                 status_code=200, 
+#                                 mimetype="application/json")
+
+# async def update_job_title_background(object_id, job_title):
+#     """Update job title in the background after responding to B2C."""
+#     try:
+#         token = get_graph_access_token()
+#         if not token:
+#             logging.error("Failed to get access token for background update")
+#             return
+            
+#         user_data = get_user_data(object_id, token)
+#         if not user_data:
+#             logging.error(f"Failed to get user data for {object_id}")
+#             return
+            
+#         if not user_data.get("jobTitle"):
+#             update_success = update_user_job_title(object_id, job_title, token)
+#             if update_success:
+#                 logging.info(f"Job title updated successfully for {object_id}")
+#             else:
+#                 logging.warning(f"Failed to update job title for {object_id}")
+#     except Exception as e:
+#         logging.error(f"Error in background job title update: {str(e)}")
+
+# firstly used
+
+# @app.function_name(name="AssignEmployeeJobTitle")
+# @app.route(route="assign-employee-job-title", methods=[func.HttpMethod.POST])
+# async def assign_employee_job_title(req: func.HttpRequest) -> func.HttpResponse:
+#     """Handle employee job title assignment with improved performance and reliability."""
+#     # Always prepare a valid B2C response
+#     b2c_response = {
+#         "version": "1.0.0",
+#         "action": "Continue",
+#         "jobTitle": "employee"
+#     }
+    
+#     try:
+#         # Extract object ID with minimal processing
+#         body = req.get_json()
+#         object_id = body.get("oid")
+
+#         if not object_id:
+#             logging.warning("Missing oid in request, returning default response")
+#             return func.HttpResponse(json.dumps(b2c_response), 
+#                                     status_code=200, 
+#                                     mimetype="application/json")
+
+#         # Start a background task to update the job title
+#         # This allows B2C to continue without waiting for the update to complete
+#         background_task = asyncio.create_task(
+#             update_job_title_background(object_id, "employee")
+#         )
+        
+#         # Return immediately with the response B2C needs
+#         logging.info(f"Returning response to B2C: {b2c_response}")
+#         return func.HttpResponse(json.dumps(b2c_response), 
+#                                 status_code=200, 
+#                                 mimetype="application/json")
+
+#     except Exception as e:
+#         logging.error(f"Error in assign_employee_job_title: {str(e)}")
+#         # Always return a valid response for B2C
+#         return func.HttpResponse(json.dumps(b2c_response), 
+#                                 status_code=200, 
+#                                 mimetype="application/json")
 
 @app.function_name(name="AssignAdminJobTitle")
 @app.route(route="assign-admin-job-title", methods=[func.HttpMethod.POST])
 async def assign_admin_job_title(req: func.HttpRequest) -> func.HttpResponse:
-    """Handle admin job title assignment with improved performance and reliability."""
-    # Always prepare a valid B2C response
+    """Handle admin job title assignment if jobTitle is empty, return what happened."""
+    # Base B2C response without default jobTitle
     b2c_response = {
         "version": "1.0.0",
-        "action": "Continue",
-        "jobTitle": "admin"
+        "action": "Continue"
     }
     
     try:
-        # Extract object ID with minimal processing
+        # Extract object ID from request body
         body = req.get_json()
-        object_id = body.get("oid")
-
-        if not object_id:
-            logging.warning("Missing oid in request, returning default response")
-            return func.HttpResponse(json.dumps(b2c_response), 
-                                    status_code=200, 
-                                    mimetype="application/json")
-
-        # Start a background task to update the job title
-        # This allows B2C to continue without waiting for the update to complete
-        background_task = asyncio.create_task(
-            update_job_title_background(object_id, "admin")
-        )
+        object_id = body.get("objectId")
         
-        # Return immediately with the response B2C needs
-        logging.info(f"Returning response to B2C: {b2c_response}")
-        return func.HttpResponse(json.dumps(b2c_response), 
-                                status_code=200, 
-                                mimetype="application/json")
-
+        if not object_id:
+            logging.warning("Missing objectId in request")
+            b2c_response["error"] = "Missing objectId"
+            return func.HttpResponse(
+                json.dumps(b2c_response),
+                status_code=200,  # Still 200 for B2C compatibility
+                mimetype="application/json"
+            )
+        
+        # Get Microsoft Graph API token
+        token = get_graph_access_token()
+        if not token:
+            logging.error("Failed to get access token")
+            b2c_response["error"] = "Failed to authenticate with Graph API"
+            return func.HttpResponse(
+                json.dumps(b2c_response),
+                status_code=200,
+                mimetype="application/json"
+            )
+        
+        # Fetch user data
+        user_data = get_user_data(object_id, token)
+        if not user_data:
+            logging.error(f"Failed to get user data for {object_id}")
+            b2c_response["error"] = "Failed to retrieve user data"
+            return func.HttpResponse(
+                json.dumps(b2c_response),
+                status_code=200,
+                mimetype="application/json"
+            )
+        
+        # Check and update jobTitle
+        current_job_title = user_data.get("jobTitle")
+        if not current_job_title:
+            update_success = update_user_job_title(object_id, "Admin", token)
+            if update_success:
+                logging.info(f"Job title updated to 'Admin' for {object_id}")
+                b2c_response["jobTitle"] = "Admin"
+                b2c_response["message"] = "Job title updated to 'Admin'"
+            else:
+                logging.warning(f"Failed to update job title for {object_id}")
+                b2c_response["error"] = "Failed to update job title"
+        else:
+            logging.info(f"Job title is not empty for {object_id}, current value: '{current_job_title}', skipping update")
+            b2c_response["jobTitle"] = current_job_title
+            b2c_response["message"] = f"Job title already set to '{current_job_title}'"
+        
+        # Return the response with what happened
+        logging.info(f"Returning response to B2C for {object_id}: {b2c_response}")
+        return func.HttpResponse(
+            json.dumps(b2c_response),
+            status_code=200,
+            mimetype="application/json"
+        )
+    
     except Exception as e:
         logging.error(f"Error in assign_admin_job_title: {str(e)}")
-        # Always return a valid response for B2C
-        return func.HttpResponse(json.dumps(b2c_response), 
-                                status_code=200, 
-                                mimetype="application/json")
+        b2c_response["error"] = f"Unexpected error: {str(e)}"
+        return func.HttpResponse(
+            json.dumps(b2c_response),
+            status_code=200,
+            mimetype="application/json"
+        )
 
-async def update_job_title_background(object_id, job_title):
-    """Update job title in the background after responding to B2C."""
-    try:
-        token = get_graph_access_token()
-        if not token:
-            logging.error("Failed to get access token for background update")
-            return
-            
-        user_data = get_user_data(object_id, token)
-        if not user_data:
-            logging.error(f"Failed to get user data for {object_id}")
-            return
-            
-        if not user_data.get("jobTitle"):
-            update_success = update_user_job_title(object_id, job_title, token)
-            if update_success:
-                logging.info(f"Job title updated successfully for {object_id}")
-            else:
-                logging.warning(f"Failed to update job title for {object_id}")
-    except Exception as e:
-        logging.error(f"Error in background job title update: {str(e)}")
-
-
-@app.function_name(name="AssignEmployeeJobTitle")
-@app.route(route="assign-employee-job-title", methods=[func.HttpMethod.POST])
-async def assign_employee_job_title(req: func.HttpRequest) -> func.HttpResponse:
-    """Handle employee job title assignment with improved performance and reliability."""
-    # Always prepare a valid B2C response
-    b2c_response = {
-        "version": "1.0.0",
-        "action": "Continue",
-        "jobTitle": "employee"
+# Helper functions for Microsoft Graph API
+def get_graph_access_token():
+    """Retrieve a Microsoft Graph API token using client credentials."""
+    client_id = os.getenv("AZURE_B2C_CLIENT_ID")
+    client_secret = os.getenv("AZURE_B2C_CLIENT_SECRET")
+    tenant_name = os.getenv("AZURE_B2C_TENANT_NAME")
+    token_url = f"https://login.microsoftonline.com/{tenant_name}.onmicrosoft.com/oauth2/v2.0/token"
+    
+    token_data = {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "scope": "https://graph.microsoft.com/.default",
+        "grant_type": "client_credentials"
     }
     
-    try:
-        # Extract object ID with minimal processing
-        body = req.get_json()
-        object_id = body.get("oid")
+    response = requests.post(token_url, data=token_data, headers={"Content-Type": "application/x-www-form-urlencoded"})
+    if response.status_code == 200:
+        return response.json().get("access_token")
+    logging.error(f"Token request failed: {response.text}")
+    return None
 
-        if not object_id:
-            logging.warning("Missing oid in request, returning default response")
-            return func.HttpResponse(json.dumps(b2c_response), 
-                                    status_code=200, 
-                                    mimetype="application/json")
+def get_user_data(object_id, token):
+    """Fetch user data from Microsoft Graph API."""
+    url = f"https://graph.microsoft.com/v1.0/users/{object_id}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+    response = requests.get(url, headers=headers)
+    if response.status_code == 200:
+        return response.json()
+    logging.error(f"Failed to fetch user data: {response.text}")
+    return None
 
-        # Start a background task to update the job title
-        # This allows B2C to continue without waiting for the update to complete
-        background_task = asyncio.create_task(
-            update_job_title_background(object_id, "employee")
-        )
-        
-        # Return immediately with the response B2C needs
-        logging.info(f"Returning response to B2C: {b2c_response}")
-        return func.HttpResponse(json.dumps(b2c_response), 
-                                status_code=200, 
-                                mimetype="application/json")
-
-    except Exception as e:
-        logging.error(f"Error in assign_employee_job_title: {str(e)}")
-        # Always return a valid response for B2C
-        return func.HttpResponse(json.dumps(b2c_response), 
-                                status_code=200, 
-                                mimetype="application/json")
-
-async def update_job_title_background(object_id, job_title):
-    """Update job title in the background after responding to B2C."""
-    try:
-        token = get_graph_access_token()
-        if not token:
-            logging.error("Failed to get access token for background update")
-            return
-            
-        user_data = get_user_data(object_id, token)
-        if not user_data:
-            logging.error(f"Failed to get user data for {object_id}")
-            return
-            
-        if not user_data.get("jobTitle"):
-            update_success = update_user_job_title(object_id, job_title, token)
-            if update_success:
-                logging.info(f"Job title updated successfully for {object_id}")
-            else:
-                logging.warning(f"Failed to update job title for {object_id}")
-    except Exception as e:
-        logging.error(f"Error in background job title update: {str(e)}")
+def update_user_job_title(object_id, job_title, token):
+    """Update the user's jobTitle in Azure AD."""
+    url = f"https://graph.microsoft.com/v1.0/users/{object_id}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "jobTitle": job_title
+    }
+    response = requests.patch(url, headers=headers, json=payload)
+    if response.status_code == 204:
+        return True
+    logging.error(f"Failed to update jobTitle: {response.text}")
+    return False
 
 
-
-
-# Get individual user by sub ID (userId)
+# Get individual user by sub ID (userId) with optional date filter
 @app.function_name(name="get_user_attendance")
 @app.route(route='api/attendance', methods=[func.HttpMethod.GET])
 @require_auth
@@ -2513,10 +2665,21 @@ async def get_user_attendance(req: func.HttpRequest) -> func.HttpResponse:
                 mimetype="application/json"
             )
 
-        # Fetch attendance records for the user
-        query = "SELECT * FROM c WHERE c.userId = @userId"
-        parameters = [{"name": "@userId", "value": user_id}]
+        # Extract optional date parameter from query
+        date_filter = req.params.get("date")
 
+        # Define query based on the presence of the date filter
+        if date_filter:
+            query = "SELECT * FROM c WHERE c.userId = @userId AND c.date = @date ORDER BY c.date DESC"
+            parameters = [
+                {"name": "@userId", "value": user_id},
+                {"name": "@date", "value": date_filter}
+            ]
+        else:
+            query = "SELECT * FROM c WHERE c.userId = @userId ORDER BY c.date DESC"
+            parameters = [{"name": "@userId", "value": user_id}]
+
+        # Fetch attendance records for the user
         user_attendance = list(attendance_container.query_items(
             query=query,
             parameters=parameters,
@@ -2524,10 +2687,10 @@ async def get_user_attendance(req: func.HttpRequest) -> func.HttpResponse:
         ))
 
         if not user_attendance:
-            logging.warning(f"No attendance found for userId: {user_id}")
+            logging.warning(f"No attendance found for userId: {user_id} on date: {date_filter}" if date_filter else f"No attendance found for userId: {user_id}")
             return func.HttpResponse(
-                json.dumps({"message": "No attendance records found for this user."}),
-                status_code=404,
+                json.dumps([]),
+                status_code=200,
                 mimetype="application/json"
             )
 
@@ -2546,3 +2709,1565 @@ async def get_user_attendance(req: func.HttpRequest) -> func.HttpResponse:
         )
 
 
+@app.function_name(name="editUser")
+@app.route(route='api/editUser', methods=[func.HttpMethod.PUT])  # Removed {user_id} from route
+@require_auth
+async def edit_user(req: func.HttpRequest) -> func.HttpResponse:
+    user_info = req.user_info
+    organization_id = user_info['sub']
+    
+    logging.info(f"Attempting to edit user for organization {organization_id}")
+    
+    try:
+        # Get request body
+        req_body = req.get_json()
+        
+        # Get user_id from body instead of params
+        user_id = req_body.get('user_id')
+        
+        # Validate that user_id is provided
+        if not user_id:
+            return func.HttpResponse(
+                json.dumps({"detail": "User ID is required."}),
+                mimetype="application/json",
+                status_code=400
+            )
+        
+        # Validate that role is provided
+        if 'role' not in req_body:
+            return func.HttpResponse(
+                json.dumps({"detail": "Role is required."}),
+                mimetype="application/json",
+                status_code=400
+            )
+        
+        # Validate role is either 'admin' or 'user'
+        if req_body['role'] not in ['Admin', 'User']:
+            return func.HttpResponse(
+                json.dumps({"detail": "Role must be either 'Admin' or 'User'."}),
+                mimetype="application/json",
+                status_code=400
+            )
+        
+        # Retrieve existing user from database
+        try:
+            user_document = users_container.read_item(
+                item=user_id,
+                partition_key=user_id
+            )
+        except Exception as e:
+            logging.error(f"Error reading user from database: {str(e)}")
+            return func.HttpResponse(
+                json.dumps({"detail": "User not found.", "error": str(e)}),
+                mimetype="application/json",
+                status_code=404
+            )
+        
+        # Verify the user belongs to the same organization
+        if user_document['organization_id'] != organization_id:
+            logging.warning(f"Organization mismatch: document {user_document['organization_id']} vs auth {organization_id}")
+            return func.HttpResponse(
+                json.dumps({"detail": "Unauthorized to modify this user."}),
+                mimetype="application/json",
+                status_code=403
+            )
+        
+        # Azure AD B2C Configuration
+        client_id = os.getenv("AZURE_B2C_CLIENT_ID")
+        client_secret = os.getenv("AZURE_B2C_CLIENT_SECRET")
+        tenant_name = os.getenv("AZURE_B2C_TENANT_NAME")
+        tenant_domain = os.getenv("AZURE_B2C_DOMAIN", f"{tenant_name}.onmicrosoft.com")
+        
+        # Get Microsoft Graph token
+        token_url = f"https://login.microsoftonline.com/{tenant_name}.onmicrosoft.com/oauth2/v2.0/token"
+        token_data = {
+            'client_id': client_id,
+            'client_secret': client_secret,
+            'scope': 'https://graph.microsoft.com/.default',
+            'grant_type': 'client_credentials'
+        }
+        
+        token_response = requests.post(token_url, data=token_data, headers={'Content-Type': 'application/x-www-form-urlencoded'})
+        
+        if token_response.status_code != 200:
+            logging.error(f"Token request failed: {token_response.text}")
+            return func.HttpResponse(
+                json.dumps({"detail": "Failed to authenticate with Azure AD"}),
+                mimetype="application/json",
+                status_code=500
+            )
+            
+        token_result = token_response.json()
+        access_token = token_result.get('access_token')
+        
+        if not access_token:
+            return func.HttpResponse(
+                json.dumps({"detail": "Failed to obtain access token"}),
+                mimetype="application/json",
+                status_code=500
+            )
+        
+        # Update user in Azure AD B2C
+        graph_url = f"https://graph.microsoft.com/v1.0/users/{user_document['azure_b2c_id']}"
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json"
+        }
+        
+        # Get extension app ID
+        extension_app_id = None
+        apps_url = "https://graph.microsoft.com/v1.0/applications"
+        apps_response = requests.get(apps_url, headers=headers, params={'$filter': 'displayName eq \'b2c-extensions-app\''})
+        
+        if apps_response.status_code == 200:
+            apps_data = apps_response.json()
+            if apps_data.get('value') and len(apps_data['value']) > 0:
+                extension_app_id = apps_data['value'][0]['appId'].replace('-', '')
+        
+        # Prepare update payload
+        update_payload = {
+            "jobTitle": req_body['role']
+        }
+        
+        if extension_app_id:
+            update_payload[f"extension_{extension_app_id}_Role"] = req_body['role']
+        
+        # Update in Azure AD B2C
+        b2c_response = requests.patch(graph_url, headers=headers, json=update_payload)
+        
+        if b2c_response.status_code >= 400:
+            logging.error(f"Error updating B2C user: {b2c_response.text}")
+            return func.HttpResponse(
+                json.dumps({"detail": "Failed to update user role in Azure AD B2C"}),
+                mimetype="application/json",
+                status_code=500
+            )
+        
+        # Update in database
+        user_document['role'] = req_body['role']
+        users_container.replace_item(
+            item=user_document['id'],
+            body=user_document
+        )
+        
+        return func.HttpResponse(
+            json.dumps({
+                "data": {
+                    "user_id": user_id,
+                    "role": req_body['role'],
+                    "message": "User role updated successfully"
+                }
+            }),
+            mimetype="application/json",
+            status_code=200
+        )
+        
+    except Exception as e:
+        logging.error(f"Error updating user: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"detail": f"An error occurred while updating the user: {str(e)}"}),
+            mimetype="application/json",
+            status_code=500
+        )
+
+@app.function_name(name="deleteUser")
+@app.route(route='api/deleteUser', methods=[func.HttpMethod.DELETE])
+@require_auth
+async def delete_user(req: func.HttpRequest) -> func.HttpResponse:
+    user_info = req.user_info
+    try:
+        # Parse request body
+        req_body = req.get_json()
+        
+        # Validate user_id is provided in the request body
+        if not req_body or 'user_id' not in req_body:
+            return func.HttpResponse(
+                json.dumps({"detail": "User ID is required in the request body."}),
+                mimetype="application/json",
+                status_code=400
+            )
+        
+        organization_id = user_info['sub']
+        user_id = req_body['user_id']
+
+        # Query for the user with the given ID and organization_id
+        query = "SELECT * FROM c WHERE c.id = @user_id AND c.organization_id = @organization_id"
+        parameters = [
+            {"name": "@user_id", "value": user_id},
+            {"name": "@organization_id", "value": organization_id}
+        ]
+        
+        user_items = list(users_container.query_items(
+            query=query,
+            parameters=parameters,
+            enable_cross_partition_query=True
+        ))
+
+        if not user_items:
+            return func.HttpResponse(
+                json.dumps({"detail": "User not found or you don't have permission to delete this user."}),
+                mimetype="application/json",
+                status_code=404
+            )
+
+        user_document = user_items[0]
+
+        # Check if user has an Azure B2C ID for deletion
+        if 'azure_b2c_id' in user_document:
+            # Azure AD B2C Configuration
+            client_id = os.getenv("AZURE_B2C_CLIENT_ID")
+            client_secret = os.getenv("AZURE_B2C_CLIENT_SECRET")
+            tenant_name = os.getenv("AZURE_B2C_TENANT_NAME")
+            
+            # Get Microsoft Graph token
+            token_url = f"https://login.microsoftonline.com/{tenant_name}.onmicrosoft.com/oauth2/v2.0/token"
+            token_data = {
+                'client_id': client_id,
+                'client_secret': client_secret,
+                'scope': 'https://graph.microsoft.com/.default',
+                'grant_type': 'client_credentials'
+            }
+            
+            # Get access token
+            token_response = requests.post(
+                token_url,
+                data=token_data,
+                headers={'Content-Type': 'application/x-www-form-urlencoded'}
+            )
+            
+            if token_response.status_code != 200:
+                logging.error(f"Token request failed: {token_response.text}")
+                return func.HttpResponse(
+                    json.dumps({"detail": "Failed to authenticate for user deletion."}),
+                    mimetype="application/json",
+                    status_code=500
+                )
+            
+            token_result = token_response.json()
+            
+            # Delete from Azure AD B2C
+            graph_url = f"https://graph.microsoft.com/v1.0/users/{user_document['azure_b2c_id']}"
+            headers = {
+                "Authorization": f"Bearer {token_result['access_token']}",
+                "Content-Type": "application/json"
+            }
+            
+            b2c_delete_response = requests.delete(graph_url, headers=headers)
+            
+            if b2c_delete_response.status_code >= 400:
+                logging.error(f"Failed to delete from Azure AD B2C: {b2c_delete_response.text}")
+                return func.HttpResponse(
+                    json.dumps({"detail": "Failed to delete user from Azure AD B2C."}),
+                    mimetype="application/json",
+                    status_code=500
+                )
+
+        # Delete from local database
+        users_container.delete_item(
+            item=user_document['id'],
+            partition_key=user_document.get('partition_key', user_document['id'])
+        )
+        
+        return func.HttpResponse(
+            json.dumps({"message": "User deleted successfully."}),
+            mimetype="application/json",
+            status_code=200
+        )
+
+    except Exception as e:
+        logging.error(f"Error deleting user: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"detail": "An error occurred during user deletion."}),
+            mimetype="application/json",
+            status_code=500
+        )
+    
+
+@app.function_name(name="addUser")
+@app.route(route='api/addUser', methods=[func.HttpMethod.POST])
+@require_auth
+async def add_user(req: func.HttpRequest) -> func.HttpResponse:
+    user_info = req.user_info
+    organization_id = user_info['sub']
+   
+    try:
+        # Get request body
+        req_body = req.get_json()
+       
+        # Validate required fields
+        if not all(field in req_body for field in ['name', 'email', 'role']):
+            return func.HttpResponse(
+                json.dumps({"detail": "Missing required fields. Name, email, and role are required."}),
+                mimetype="application/json",
+                status_code=400
+            )
+       
+        # Validate role is either 'admin' or 'user'
+        if req_body['role'] not in ['Admin', 'User']:
+            return func.HttpResponse(
+                json.dumps({"detail": "Role must be either 'Admin' or 'User'."}),
+                mimetype="application/json",
+                status_code=400
+            )
+       
+        # Generate a unique user ID
+        user_id = str(uuid.uuid4())
+       
+        # Create the user document for your database
+        user_document = {
+            'id': user_id,
+            'user_id': user_id,
+            'organization_id': organization_id,
+            'name': req_body['name'],
+            'email': req_body['email'],
+            'role': req_body['role'],
+            'created_at': pendulum.now().isoformat()
+        }
+       
+        # Insert the user document into the users container
+        users_container.create_item(body=user_document)
+       
+        # Azure AD B2C Configuration
+        client_id = os.getenv("AZURE_B2C_CLIENT_ID")
+        client_secret = os.getenv("AZURE_B2C_CLIENT_SECRET")
+        tenant_name = os.getenv("AZURE_B2C_TENANT_NAME")
+        tenant_domain = os.getenv("AZURE_B2C_DOMAIN", f"{tenant_name}.onmicrosoft.com")
+       
+        # Get mail nickname from email
+        mail_nickname = req_body['email'].split('@')[0]
+       
+        # Generate a secure random password that meets Azure AD B2C requirements
+        def generate_secure_password():
+            chars = string.ascii_lowercase + string.ascii_uppercase + string.digits
+            special_chars = "!@#$%^&*()-_=+[]{}|;:,.<>?"
+           
+            while True:
+                password = ''.join(random.choice(chars) for _ in range(10))
+                password += random.choice(special_chars)
+                password += random.choice(special_chars)
+               
+                password_list = list(password)
+                random.shuffle(password_list)
+                password = ''.join(password_list)
+               
+                email_parts = req_body['email'].lower().split('@')
+                username_part = email_parts[0]
+                domain_part = email_parts[1] if len(email_parts) > 1 else ""
+               
+                if (username_part not in password.lower() and
+                    domain_part not in password.lower()):
+                    return password
+       
+        password = generate_secure_password()
+       
+        # Use the standard Azure AD endpoint for client credentials flow
+        token_url = f"https://login.microsoftonline.com/{tenant_name}.onmicrosoft.com/oauth2/v2.0/token"
+       
+        # Get Microsoft Graph token using client credentials flow
+        token_data = {
+            'client_id': client_id,
+            'client_secret': client_secret,
+            'scope': 'https://graph.microsoft.com/.default',
+            'grant_type': 'client_credentials'
+        }
+       
+        logging.info(f"Requesting token from: {token_url}")
+       
+        token_response = requests.post(
+            token_url,
+            data=token_data,
+            headers={'Content-Type': 'application/x-www-form-urlencoded'}
+        )
+       
+        if token_response.status_code != 200:
+            logging.error(f"Token request failed with status {token_response.status_code}")
+            logging.error(f"Response body: {token_response.text}")
+            return func.HttpResponse(
+                json.dumps({"detail": f"Failed to authenticate with Azure AD: {token_response.text}"}),
+                mimetype="application/json",
+                status_code=500
+            )
+           
+        token_result = token_response.json()
+       
+        if "access_token" not in token_result:
+            logging.error(f"Unable to get token: {token_result.get('error')}")
+            return func.HttpResponse(
+                json.dumps({"detail": "Failed to authenticate with Azure AD"}),
+                mimetype="application/json",
+                status_code=500
+            )
+       
+        # Create user in Azure AD B2C
+        graph_url = "https://graph.microsoft.com/v1.0/users"
+        headers = {
+            "Authorization": f"Bearer {token_result['access_token']}",
+            "Content-Type": "application/json"
+        }
+       
+        # Prepare the user payload for Azure AD B2C
+        display_name = req_body['name']
+        email = req_body['email']
+       
+        # Use the verified tenant domain for userPrincipalName with a unique identifier
+        unique_id = user_id.split('-')[0]
+        user_principal_name = f"{mail_nickname}_{unique_id}@{tenant_domain}"
+       
+        # Get the extension app ID for custom attributes
+        extension_app_id = None
+        try:
+            apps_url = "https://graph.microsoft.com/v1.0/applications"
+            apps_response = requests.get(
+                apps_url,
+                headers=headers,
+                params={'$filter': 'displayName eq \'b2c-extensions-app\''}
+            )
+           
+            if apps_response.status_code == 200:
+                apps_data = apps_response.json()
+               
+                if apps_data.get('value') and len(apps_data['value']) > 0:
+                    app_id = apps_data['value'][0]['appId']
+                    extension_app_id = app_id.replace('-', '')
+                    logging.info(f"Found extension app ID: {extension_app_id}")
+           
+        except Exception as e:
+            logging.warning(f"Could not retrieve extension app ID: {str(e)}")
+       
+        # Create user payload with identities included directly
+        user_payload = {
+            "accountEnabled": True,
+            "displayName": display_name,
+            "mailNickname": f"{mail_nickname}_{unique_id}",
+            "userPrincipalName": user_principal_name,
+            "passwordProfile": {
+                "forceChangePasswordNextSignIn": False,
+                "password": password
+            },
+            "passwordPolicies": "DisablePasswordExpiration",
+            "mail": email,  # Set primary email attribute
+            "otherMails": [email],
+            # Include identities directly in initial creation
+            "identities": [
+                {
+                    "signInType": "emailAddress",
+                    "issuer": tenant_domain,  # Use tenant_name instead of tenant_domain
+                    "issuerAssignedId": email
+                },
+                {
+                    "signInType": "userPrincipalName",
+                    "issuer": tenant_domain,
+                    "issuerAssignedId": user_principal_name
+                }
+            ],
+            "jobTitle": req_body['role']
+        }
+       
+        # Add role and email as custom attributes
+        if extension_app_id:
+            user_payload[f"extension_{extension_app_id}_Role"] = req_body['role']
+            user_payload[f"extension_{extension_app_id}_Email"] = email
+            # Add a flag to indicate email is the sign-in identity
+            user_payload[f"extension_{extension_app_id}_SignInWithEmail"] = "true"
+       
+        # Create the user in Azure AD B2C
+        try:
+            logging.info(f"Creating user in B2C with email {email} and UPN {user_principal_name}")
+            b2c_response = requests.post(graph_url, headers=headers, json=user_payload)
+           
+            if b2c_response.status_code >= 400:
+                logging.error(f"Error creating B2C user: Status {b2c_response.status_code}")
+                logging.error(f"Response: {b2c_response.text}")
+               
+            b2c_response.raise_for_status()
+           
+            # Get the Azure AD B2C user ID
+            b2c_user = b2c_response.json()
+            b2c_user_id = b2c_user.get('id')
+           
+            # Verify that identities were properly set - if not, update them
+            user_get_url = f"https://graph.microsoft.com/v1.0/users/{b2c_user_id}"
+            user_get_response = requests.get(user_get_url, headers=headers)
+            current_user = user_get_response.json()
+           
+            # Check if email identity existsa
+            email_identity_exists = False
+            if 'identities' in current_user:
+                for identity in current_user['identities']:
+                    if (identity.get('signInType') == 'emailAddress' and
+                        identity.get('issuerAssignedId') == email):
+                        email_identity_exists = True
+                        break
+           
+            # If email identity doesn't exist, add it
+            if not email_identity_exists:
+                logging.info(f"Email identity not found, adding it explicitly for user {b2c_user_id}")
+               
+                # Get current identities
+                current_identities = current_user.get('identities', [])
+               
+                # Add email identity
+                current_identities.append({
+                    "signInType": "emailAddress",
+                    "issuer": tenant_name,
+                    "issuerAssignedId": email
+                })
+               
+                # Update with combined identities
+                identity_payload = {
+                    "identities": current_identities
+                }
+               
+                identity_response = requests.patch(
+                    user_get_url,
+                    headers=headers,
+                    json=identity_payload
+                )
+               
+                if identity_response.status_code >= 400:
+                    logging.warning(f"Could not add email identity: {identity_response.status_code}")
+                    logging.warning(f"Response: {identity_response.text}")
+                else:
+                    logging.info(f"Successfully added email identity for user {b2c_user_id}")
+           
+            # Store all relevant sign-in info in your database
+            user_document['azure_b2c_id'] = b2c_user_id
+            users_container.replace_item(
+                item=user_document['id'],
+                body=user_document
+            )
+           
+            # Return the user credentials in the response
+            return func.HttpResponse(
+                json.dumps({
+                    "data": {
+                        "user_id": user_id,
+                        "azure_b2c_id": b2c_user_id,
+                        "credentials": {
+                            "email": email,
+                            "password": password
+                        },
+                        "message": "User added successfully to database and Azure AD B2C"
+                    }
+                }),
+                mimetype="application/json",
+                status_code=201
+            )
+        except requests.exceptions.HTTPError as http_err:
+            error_message = http_err.response.json() if http_err.response.content else str(http_err)
+            logging.error(f"Error creating user in Azure AD B2C: {error_message}")
+           
+            # User was created in your database but not in B2C
+            return func.HttpResponse(
+                json.dumps({
+                    "data": {
+                        "user_id": user_id,
+                        "message": "User added to database but failed to register in Azure AD B2C",
+                        "azure_error": error_message
+                    }
+                }),
+                mimetype="application/json",
+                status_code=500
+            )
+    except Exception as e:
+        logging.error(f"Error adding user: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"detail": f"An error occurred while adding the user: {str(e)}"}),
+            mimetype="application/json",
+            status_code=500
+        )
+    
+
+@app.function_name(name="getAllUsers")
+@app.route(route='api/getAllUsers', methods=[func.HttpMethod.GET])
+@require_auth
+async def get_all_users(req: func.HttpRequest) -> func.HttpResponse:
+    user_info = req.user_info
+    organization_id = user_info['sub']
+    
+    try:
+        # Get pagination parameters from query string (default to page 1, limit 10)
+        page = int(req.params.get('page', 1))
+        limit = int(req.params.get('limit', 10))
+        
+        # Ensure valid pagination values
+        page = max(1, page)  # Minimum page is 1
+        offset = (page - 1) * limit
+        
+        # Debug logging
+        logging.info(f"Fetching users for organization_id: {organization_id}, page: {page}, limit: {limit}")
+        
+        # Query to get users for the organization with pagination
+        query = "SELECT * FROM c WHERE c.organization_id = @org_id ORDER BY c._ts DESC OFFSET @offset LIMIT @limit"
+        
+        # Query parameters
+        query_params = [
+            {"name": "@org_id", "value": organization_id},
+            {"name": "@offset", "value": offset},
+            {"name": "@limit", "value": limit}
+        ]
+        
+        # Query options with cross-partition query explicitly enabled
+        query_options = {
+            'enable_cross_partition_query': True
+        }
+        
+        # Get total count query
+        count_query = "SELECT VALUE COUNT(1) FROM c WHERE c.organization_id = @org_id"
+        count_params = [{"name": "@org_id", "value": organization_id}]
+        
+        # Query users container
+        try:
+            # Get paginated items
+            items = list(users_container.query_items(
+                query=query,
+                parameters=query_params,
+                **query_options
+            ))
+            
+            # Get total count
+            total_count = list(users_container.query_items(
+                query=count_query,
+                parameters=count_params,
+                enable_cross_partition_query=True
+            ))[0]
+            
+            # Debug logging
+            logging.info(f"Query returned {len(items)} items out of {total_count} total")
+            
+            # If no items on this page but there are users, log all users to understand why
+            if not items and total_count > 0:
+                all_users = list(users_container.query_items(
+                    query="SELECT * FROM c",
+                    enable_cross_partition_query=True
+                ))
+                logging.info(f"Total users in container: {len(all_users)}")
+                for user in all_users:
+                    logging.info(f"User: {user.get('id')} - Org ID: {user.get('organization_id')}")
+            
+            # Process users to remove sensitive information
+            users = []
+            for user in items:
+                if 'passwordHash' in user:
+                    del user['passwordHash']
+                
+                clean_user = {
+                    'id': user.get('id'),
+                    'name': user.get('name'),
+                    'email': user.get('email'),
+                    'role': user.get('role'),
+                    'created_at': user.get('created_at'),
+                    'updated_at': user.get('updated_at', user.get('created_at')),
+                    'organization_id': user.get('organization_id')
+                }
+                users.append(clean_user)
+                
+        except exceptions as e:
+            logging.error(f"Cosmos DB Error: {str(e)}")
+            return func.HttpResponse(
+                json.dumps({"detail": f"Database error: {str(e)}"}),
+                mimetype="application/json",
+                status_code=500
+            )
+        
+        # Calculate pagination metadata
+        total_pages = (total_count + limit - 1) // limit  # Ceiling division
+        
+        # Prepare response with pagination info
+        response = {
+            "data": {
+                "users": users,
+                "pagination": {
+                    "current_page": page,
+                    "per_page": limit,
+                    "total_items": total_count,
+                    "total_pages": total_pages,
+                    "has_next": page < total_pages,
+                    "has_previous": page > 1
+                },
+                "organization_id": organization_id
+            }
+        }
+        
+        return func.HttpResponse(
+            json.dumps(response),
+            mimetype="application/json",
+            status_code=200
+        )
+        
+    except Exception as e:
+        logging.error(f"Error getting users: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"detail": f"An error occurred while getting users: {str(e)}"}),
+            mimetype="application/json",
+            status_code=500
+        )
+   
+
+#    # Microsoft Graph API Endpoints
+# TOKEN_URL = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
+# GRAPH_API_URL = "https://graph.microsoft.com/v1.0/users"
+
+# Allowed image formats
+# ALLOWED_IMAGE_FORMATS = (".jpg", ".jpeg", ".png")
+
+# # Function to generate a secure password
+# def generate_password():
+#     import string, random
+#     characters = string.ascii_letters + string.digits + "!@#$%^&*"
+#     return "".join(random.choice(characters) for _ in range(12))
+
+# # Function to get Azure AD B2C access token
+# def get_access_token():
+#     payload = {
+#         "client_id": CLIENT_ID,
+#         "client_secret": CLIENT_SECRET,
+#         "scope": "https://graph.microsoft.com/.default",
+#         "grant_type": "client_credentials",
+#     }
+#     response = requests.post(TOKEN_URL, data=payload)
+    
+#     if response.status_code == 200:
+#         return response.json().get("access_token")
+    
+#     logging.error(f"Failed to get Azure AD token: {response.text}")
+#     raise Exception("Failed to retrieve Azure AD token")
+
+# # Function to create a user in Azure AD B2C
+# def create_azure_b2c_user(employee_name, email, role):
+#     password = generate_password()
+#     access_token = get_access_token()
+
+#     headers = {
+#         "Authorization": f"Bearer {access_token}",
+#         "Content-Type": "application/json",
+#     }
+
+#     user_data = {
+#         "accountEnabled": True,
+#         "displayName": employee_name,
+#         "givenName": employee_name.split()[0],
+#         "surname": employee_name.split()[-1],
+#         "mail": email,
+#         "userPrincipalName": email,
+#         "mailNickname": email.split("@")[0],
+#         "passwordProfile": {
+#             "forceChangePasswordNextSignIn": False,
+#             "password": password,
+#         },
+#         "identities": [
+#             {
+#                 "signInType": "emailAddress",
+#                 "issuer": TENANT_NAME,
+#                 "issuerAssignedId": email,
+#             }
+#         ],
+#         "jobTitle": role,
+#     }
+
+#     response = requests.post(GRAPH_API_URL, headers=headers, json=user_data)
+    
+#     if response.status_code == 201:
+#         return response.json()["id"]
+    
+#     logging.error(f"Azure AD B2C user creation failed: {response.text}")
+#     raise Exception(f"Azure AD B2C user creation failed: {response.text}")
+
+# # Azure Function - Add Employee
+# @app.function_name(name="add_employee")
+# @app.route(route="employee", methods=[func.HttpMethod.POST])
+# @require_auth
+# async def add_employee(req: func.HttpRequest) -> func.HttpResponse:
+#     try:
+#         logging.info(f"Token validated for user: {req.user_info.get('email', 'unknown')}")
+#         logging.info(f"User Info: {req.user_info}")
+
+#         # Extract JSON data from the request body
+#         json_data = req.get_json()
+
+#         if not json_data:
+#             return func.HttpResponse(
+#                 body=json.dumps({'error': 'JSON data is required in the request body'}),
+#                 status_code=400,
+#                 mimetype="application/json"
+#             )
+
+#         # Extract fields from the JSON data
+#         employee_id = json_data.get("employeeId")
+#         name = json_data.get("employeeName")
+#         role = json_data.get("role")
+#         email = json_data.get("email")
+#         image_name = json_data.get("imageName")
+
+#         # Validate required fields
+#         if not all([employee_id, name, role, email]):
+#             return func.HttpResponse(
+#                 body=json.dumps({'error': 'All fields except image are required'}),
+#                 status_code=400,
+#                 mimetype="application/json"
+#             )
+
+#         # Validate email format
+#         EMAIL_REGEX = r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
+#         if not re.match(EMAIL_REGEX, email):
+#             return func.HttpResponse(
+#                 body=json.dumps({'error': 'Invalid email format'}),
+#                 status_code=400,
+#                 mimetype="application/json"
+#             )
+
+#         # Validate image format if provided
+#         if image_name and not image_name.lower().endswith(ALLOWED_IMAGE_FORMATS):
+#             return func.HttpResponse(
+#                 body=json.dumps({'error': f'Invalid image format. Allowed formats: {ALLOWED_IMAGE_FORMATS}'}),
+#                 status_code=400,
+#                 mimetype="application/json"
+#             )
+
+#         # Get `organizationId` from token
+#         organization_id = req.user_info.get("user_id")
+
+#         if not organization_id:
+#             return func.HttpResponse(
+#                 body=json.dumps({'error': 'Invalid token: organizationId (sub) missing'}),
+#                 status_code=401,
+#                 mimetype="application/json"
+#             )
+
+#         # Check if employeeId already exists in Cosmos DB
+#         query = f"SELECT * FROM c WHERE c.employeeId = '{employee_id}'"
+#         existing_employees = list(employee_container.query_items(query=query, enable_cross_partition_query=True))
+
+#         if existing_employees:
+#             return func.HttpResponse(
+#                 body=json.dumps({'warn': f'Employee with employeeId {employee_id} already exists'}),
+#                 status_code=409,  # Conflict status code
+#                 mimetype="application/json"
+#             )
+
+#         # Create user in Azure AD B2C
+#         azure_b2c_id = create_azure_b2c_user(name, email, role)
+
+#         # Upload image if provided
+#         image_url = json_data.get("imageBase64")  # Assuming image is base64-encoded and handled separately
+
+#         # Create employee record
+#         employee_record = {
+#             "id": str(uuid.uuid4()),
+#             "employeeId": employee_id,
+#             "employeeName": name,
+#             "role": role,
+#             "email": email,
+#             "imageUrl": image_url,
+#             "organizationId": organization_id,
+#             "userId": organization_id,
+#             "azure_b2c_id": azure_b2c_id
+#         }
+
+#         # Save employee record in Cosmos DB
+#         employee_container.create_item(body=employee_record)
+
+#         return func.HttpResponse(
+#             body=json.dumps({'message': 'Employee added successfully', 'data': employee_record}),
+#             status_code=201,
+#             mimetype="application/json"
+#         )
+
+#     except Exception as e:
+#         logging.error(f"Error adding employee: {str(e)}")
+#         return func.HttpResponse(
+#             body=json.dumps({'error': str(e)}),
+#             status_code=500,
+#             mimetype="application/json"
+#         )
+
+
+
+    
+ALLOWED_IMAGE_FORMATS = (".jpg", ".jpeg", ".png")
+
+@app.function_name(name="add_employee")
+@app.route(route='employee', methods=[func.HttpMethod.POST])
+@require_auth
+async def add_employee(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        logging.info(f"Token validated for user: {req.user_info.get('email', 'unknown')}")
+        logging.info(f"User Info: {req.user_info}")
+        
+        # Get organization_id from token
+        organization_id = req.user_info.get('user_id')
+        if not organization_id:
+            return func.HttpResponse(
+                body=json.dumps({'error': 'Invalid token: organizationId (sub) missing'}),
+                status_code=401,
+                mimetype="application/json"
+            )
+
+        # Extract JSON data from the request body
+        json_data = req.get_json()
+
+        if not json_data:
+            return func.HttpResponse(
+                body=json.dumps({'error': 'JSON data is required in the request body'}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        # Extract fields from the JSON data
+        employee_id = json_data.get('employeeId')
+        name = json_data.get('employeeName')
+        role = json_data.get('role')
+        email = json_data.get('email')
+        image_name = json_data.get('imageName')
+
+        # Check if required fields are provided
+        if not employee_id or not name or not role or not email:
+            return func.HttpResponse(
+                body=json.dumps({'error': 'All fields except image are required'}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        # Validate email format using regex
+        EMAIL_REGEX = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+        if not re.match(EMAIL_REGEX, email):
+            return func.HttpResponse(
+                body=json.dumps({'error': 'Invalid email format'}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        # Validate role format
+        if role not in ['Admin', 'User', 'Employee']:
+            return func.HttpResponse(
+                body=json.dumps({'error': 'Role must be either Admin, User, or Employee'}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        # Validate image format if image is provided
+        if image_name:
+            if not image_name.lower().endswith(ALLOWED_IMAGE_FORMATS):
+                return func.HttpResponse(
+                    body=json.dumps({'error': f'Invalid image format. Allowed formats: {ALLOWED_IMAGE_FORMATS}'}),
+                    status_code=400,
+                    mimetype="application/json"
+                )
+
+        # Check if employeeId already exists in Cosmos DB
+        query = f"SELECT * FROM c WHERE c.employeeId = '{employee_id}'"
+        existing_employees = list(employee_container.query_items(query=query, enable_cross_partition_query=True))
+
+        if existing_employees:
+            return func.HttpResponse(
+                body=json.dumps({'Warn': f'Employee with employeeId {employee_id} already exists'}),
+                status_code=409,  # Conflict status code
+                mimetype="application/json"
+            )
+
+        # Generate a unique user ID for the employee
+        user_id = str(uuid.uuid4())
+        
+        # Upload the image if provided
+        image_url = upload_image_to_blob(json_data.get('imageBase64'), employee_id) if json_data.get('imageBase64') else None
+
+        # FIRST, CREATE THE USER IN AZURE AD B2C
+        # Azure AD B2C Configuration
+        client_id = os.getenv("AZURE_B2C_CLIENT_ID")
+        client_secret = os.getenv("AZURE_B2C_CLIENT_SECRET")
+        tenant_name = os.getenv("AZURE_B2C_TENANT_NAME")
+        tenant_domain = os.getenv("AZURE_B2C_DOMAIN", f"{tenant_name}.onmicrosoft.com")
+        
+        # Get mail nickname from email
+        mail_nickname = email.split('@')[0]
+        
+        # Generate a secure random password
+        def generate_secure_password():
+            chars = string.ascii_lowercase + string.ascii_uppercase + string.digits
+            special_chars = "!@#$%^&*()-_=+[]{}|;:,.<>?"
+            
+            while True:
+                password = ''.join(random.choice(chars) for _ in range(10))
+                password += random.choice(special_chars)
+                password += random.choice(special_chars)
+                
+                password_list = list(password)
+                random.shuffle(password_list)
+                password = ''.join(password_list)
+                
+                email_parts = email.lower().split('@')
+                username_part = email_parts[0]
+                domain_part = email_parts[1] if len(email_parts) > 1 else ""
+                
+                if (username_part not in password.lower() and
+                    domain_part not in password.lower()):
+                    return password
+        
+        password = generate_secure_password()
+        
+        # Use the standard Azure AD endpoint for client credentials flow
+        token_url = f"https://login.microsoftonline.com/{tenant_name}.onmicrosoft.com/oauth2/v2.0/token"
+        
+        # Get Microsoft Graph token using client credentials flow
+        token_data = {
+            'client_id': client_id,
+            'client_secret': client_secret,
+            'scope': 'https://graph.microsoft.com/.default',
+            'grant_type': 'client_credentials'
+        }
+        
+        logging.info(f"Requesting token from: {token_url}")
+        
+        token_response = requests.post(
+            token_url,
+            data=token_data,
+            headers={'Content-Type': 'application/x-www-form-urlencoded'}
+        )
+        
+        if token_response.status_code != 200:
+            logging.error(f"Token request failed with status {token_response.status_code}")
+            logging.error(f"Response body: {token_response.text}")
+            return func.HttpResponse(
+                body=json.dumps({
+                    'error': f"Failed to authenticate with Azure AD: {token_response.text}",
+                }),
+                status_code=500,
+                mimetype="application/json"
+            )
+            
+        token_result = token_response.json()
+        
+        if "access_token" not in token_result:
+            logging.error(f"Unable to get token: {token_result.get('error')}")
+            return func.HttpResponse(
+                body=json.dumps({
+                    'error': 'Failed to authenticate with Azure AD',
+                }),
+                status_code=500,
+                mimetype="application/json"
+            )
+        
+        # Create user in Azure AD B2C
+        graph_url = "https://graph.microsoft.com/v1.0/users"
+        headers = {
+            "Authorization": f"Bearer {token_result['access_token']}",
+            "Content-Type": "application/json"
+        }
+        
+        # Prepare the user payload for Azure AD B2C
+        display_name = name
+        
+        # Use the verified tenant domain for userPrincipalName with a unique identifier
+        unique_id = user_id.split('-')[0]
+        user_principal_name = f"{mail_nickname}_{unique_id}@{tenant_domain}"
+        
+        # Get the extension app ID for custom attributes
+        extension_app_id = None
+        try:
+            apps_url = "https://graph.microsoft.com/v1.0/applications"
+            apps_response = requests.get(
+                apps_url,
+                headers=headers,
+                params={'$filter': 'displayName eq \'b2c-extensions-app\''}
+            )
+            
+            if apps_response.status_code == 200:
+                apps_data = apps_response.json()
+                
+                if apps_data.get('value') and len(apps_data['value']) > 0:
+                    app_id = apps_data['value'][0]['appId']
+                    extension_app_id = app_id.replace('-', '')
+                    logging.info(f"Found extension app ID: {extension_app_id}")
+            
+        except Exception as e:
+            logging.warning(f"Could not retrieve extension app ID: {str(e)}")
+        
+        # Create user payload with identities included directly
+        user_payload = {
+            "accountEnabled": True,
+            "displayName": display_name,
+            "mailNickname": f"{mail_nickname}_{unique_id}",
+            "userPrincipalName": user_principal_name,
+            "passwordProfile": {
+                "forceChangePasswordNextSignIn": False,
+                "password": password
+            },
+            "passwordPolicies": "DisablePasswordExpiration",
+            "mail": email,  # Set primary email attribute
+            "otherMails": [email],
+            # Include identities directly in initial creation
+            "identities": [
+                {
+                    "signInType": "emailAddress",
+                    "issuer": tenant_domain,
+                    "issuerAssignedId": email
+                },
+                {
+                    "signInType": "userPrincipalName",
+                    "issuer": tenant_domain,
+                    "issuerAssignedId": user_principal_name
+                }
+            ],
+            "jobTitle": role
+        }
+        
+        # Add role, email, and employeeId as custom attributes
+        if extension_app_id:
+            user_payload[f"extension_{extension_app_id}_Role"] = role
+            user_payload[f"extension_{extension_app_id}_Email"] = email
+            user_payload[f"extension_{extension_app_id}_EmployeeId"] = employee_id
+            user_payload[f"extension_{extension_app_id}_SignInWithEmail"] = "true"
+        
+        # Create the user in Azure AD B2C
+        try:
+            logging.info(f"Creating user in B2C with email {email} and UPN {user_principal_name}")
+            b2c_response = requests.post(graph_url, headers=headers, json=user_payload)
+            
+            if b2c_response.status_code >= 400:
+                logging.error(f"Error creating B2C user: Status {b2c_response.status_code}")
+                logging.error(f"Response: {b2c_response.text}")
+                
+                # Return error since we're doing Azure first approach
+                return func.HttpResponse(
+                    body=json.dumps({
+                        'error': f"Failed to create user in Azure AD B2C: {b2c_response.text}"
+                    }),
+                    status_code=500,
+                    mimetype="application/json"
+                )
+            
+            b2c_response.raise_for_status()
+            
+            # Get the Azure AD B2C user ID
+            b2c_user = b2c_response.json()
+            b2c_user_id = b2c_user.get('id')
+            
+            # Verify that identities were properly set - if not, update them
+            user_get_url = f"https://graph.microsoft.com/v1.0/users/{b2c_user_id}"
+            user_get_response = requests.get(user_get_url, headers=headers)
+            current_user = user_get_response.json()
+            
+            # Check if email identity exists
+            email_identity_exists = False
+            if 'identities' in current_user:
+                for identity in current_user['identities']:
+                    if (identity.get('signInType') == 'emailAddress' and
+                        identity.get('issuerAssignedId') == email):
+                        email_identity_exists = True
+                        break
+            
+            # If email identity doesn't exist, add it
+            if not email_identity_exists:
+                logging.info(f"Email identity not found, adding it explicitly for user {b2c_user_id}")
+                
+                # Get current identities
+                current_identities = current_user.get('identities', [])
+                
+                # Add email identity
+                current_identities.append({
+                    "signInType": "emailAddress",
+                    "issuer": tenant_name,
+                    "issuerAssignedId": email
+                })
+                
+                # Update with combined identities
+                identity_payload = {
+                    "identities": current_identities
+                }
+                
+                identity_response = requests.patch(
+                    user_get_url,
+                    headers=headers,
+                    json=identity_payload
+                )
+                
+                if identity_response.status_code >= 400:
+                    logging.warning(f"Could not add email identity: {identity_response.status_code}")
+                    logging.warning(f"Response: {identity_response.text}")
+                else:
+                    logging.info(f"Successfully added email identity for user {b2c_user_id}")
+            
+            # NOW THAT AZURE CREATION IS SUCCESSFUL, CREATE THE EMPLOYEE RECORD
+            # Create the employee record with the Azure B2C ID
+            employee_record = {
+                'id': b2c_user_id,
+                'employeeId': employee_id,
+                'employeeName': name,
+                'role': role,
+                'email': email,
+                'imageUrl': image_url,
+                'organizationId': organization_id,
+                'userId': organization_id,
+                'azure_b2c_id': b2c_user_id,
+                'created_at': pendulum.now().isoformat()
+            }
+
+            # Save the employee record in Cosmos DB
+            employee_container.create_item(body=employee_record)
+            
+            # Return the user credentials in the response
+            return func.HttpResponse(
+                body=json.dumps({
+                    'message': 'Employee added successfully to Azure AD B2C and database',
+                    'data': {
+                        'employee': employee_record,
+                        'azure_b2c_id': b2c_user_id,
+                        'credentials': {
+                            'email': email,
+                            'password': password
+                        }
+                    }
+                }),
+                status_code=201,
+                mimetype="application/json"
+            )
+            
+        except requests.exceptions.HTTPError as http_err:
+            error_message = http_err.response.json() if http_err.response.content else str(http_err)
+            logging.error(f"Error creating user in Azure AD B2C: {error_message}")
+            
+            # Return error since we're doing Azure first
+            return func.HttpResponse(
+                body=json.dumps({
+                    'error': f"Failed to create user in Azure AD B2C: {error_message}"
+                }),
+                status_code=500,
+                mimetype="application/json"
+            )
+            
+    except Exception as e:
+        logging.error(f"Error adding employee: {str(e)}")
+        return func.HttpResponse(
+            body=json.dumps({'error': str(e)}),
+            status_code=500,
+            mimetype="application/json"
+        )
+    
+
+
+@app.function_name(name="delete_employee")
+@app.route(route="employee/{employee_id}", methods=[func.HttpMethod.DELETE])
+async def delete_employee(req: func.HttpRequest) -> func.HttpResponse:
+    # Validate and decode the token
+    try:
+        user_info = validate_and_decode_token(req)
+        logging.info(f"Token validated for user: {user_info.get('email', 'unknown')}")
+    except Exception as e:
+        logging.error(f"Unauthorized Request: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"error": "Unauthorized: Missing or Invalid Token"}),
+            status_code=401,
+            mimetype="application/json"
+        )
+
+    logging.info('Processing delete employee request.')
+
+    try:
+        # Get the employee ID from the route parameters
+        employee_id = req.route_params.get('employee_id')
+
+        # Query to fetch the employee record by id
+        query = f"SELECT * FROM c WHERE c.employeeId = '{employee_id}'"
+        logging.info(f"Query: {query}")
+        items = list(employee_container.query_items(query=query, enable_cross_partition_query=True))
+        logging.info(f"Items found: {items}")
+
+        if items:
+            item = items[0]  # Get the first (and expected only) result
+
+            # Get the Azure AD B2C ID (assuming it's stored as 'azure_b2c_id')
+            b2c_user_id = item.get('azure_b2c_id')
+            if not b2c_user_id:
+                return func.HttpResponse(
+                    body=json.dumps({'error': 'Employee does not have an Azure B2C ID'}),
+                    status_code=400,
+                    mimetype="application/json"
+                )
+
+            # Azure AD B2C Configuration
+            client_id = os.getenv("AZURE_B2C_CLIENT_ID")
+            client_secret = os.getenv("AZURE_B2C_CLIENT_SECRET")
+            tenant_name = os.getenv("AZURE_B2C_TENANT_NAME")
+            tenant_domain = os.getenv("AZURE_B2C_DOMAIN", f"{tenant_name}.onmicrosoft.com")
+
+            # Get Microsoft Graph token using client credentials flow
+            token_url = f"https://login.microsoftonline.com/{tenant_name}.onmicrosoft.com/oauth2/v2.0/token"
+            token_data = {
+                'client_id': client_id,
+                'client_secret': client_secret,
+                'scope': 'https://graph.microsoft.com/.default',
+                'grant_type': 'client_credentials'
+            }
+
+            token_response = requests.post(
+                token_url,
+                data=token_data,
+                headers={'Content-Type': 'application/x-www-form-urlencoded'}
+            )
+
+            if token_response.status_code != 200:
+                logging.error(f"Token request failed with status {token_response.status_code}")
+                logging.error(f"Response body: {token_response.text}")
+                return func.HttpResponse(
+                    body=json.dumps({
+                        'error': f"Failed to authenticate with Azure AD: {token_response.text}",
+                    }),
+                    status_code=500,
+                    mimetype="application/json"
+                )
+
+            token_result = token_response.json()
+            if "access_token" not in token_result:
+                logging.error(f"Unable to get token: {token_result.get('error')}")
+                return func.HttpResponse(
+                    body=json.dumps({
+                        'error': 'Failed to authenticate with Azure AD',
+                    }),
+                    status_code=500,
+                    mimetype="application/json"
+                )
+
+            # Delete user from Azure AD B2C
+            graph_url = f"https://graph.microsoft.com/v1.0/users/{b2c_user_id}"
+            headers = {
+                "Authorization": f"Bearer {token_result['access_token']}",
+                "Content-Type": "application/json"
+            }
+
+            delete_response = requests.delete(graph_url, headers=headers)
+
+            if delete_response.status_code >= 400:
+                logging.error(f"Error deleting B2C user: Status {delete_response.status_code}")
+                logging.error(f"Response: {delete_response.text}")
+                return func.HttpResponse(
+                    body=json.dumps({
+                        'error': f"Failed to delete user from Azure AD B2C: {delete_response.text}"
+                    }),
+                    status_code=500,
+                    mimetype="application/json"
+                )
+
+            logging.info(f"Employee {employee_id} deleted successfully from Azure AD B2C.")
+
+            # Delete the employee record from Cosmos DB
+            # Use the partition key and document id for deletion
+            employee_container.delete_item(item=item['id'], partition_key=item['id'])
+
+            logging.info(f"Employee {employee_id} deleted successfully from Cosmos DB.")
+
+            return func.HttpResponse(
+                body=json.dumps({'message': 'Employee deleted successfully from Azure AD B2C and database'}),
+                status_code=200,
+                mimetype="application/json"
+            )
+
+        return func.HttpResponse(
+            body=json.dumps({'message': 'Employee not found'}),
+            status_code=404,
+            mimetype="application/json"
+        )
+
+    except Exception as e:
+        logging.error(f"Error deleting employee: {str(e)}")
+        return func.HttpResponse(
+            body=json.dumps({'error': str(e)}),
+            status_code=500,
+            mimetype="application/json"
+        )
+    
+
+
+@app.function_name(name="update_employee")
+@app.route(route="update-employee/{employee_id}", methods=[func.HttpMethod.PUT])
+@require_auth
+async def update_employee(req: func.HttpRequest) -> func.HttpResponse:
+    logging.info(f"Token validated for user: {req.user_info.get('email', 'unknown')}")
+    logging.info('Processing update employee request.')
+
+    try:
+        # Get employee ID from the route and validate
+        employee_id = str(req.route_params.get('employee_id'))
+        if not employee_id:
+            return func.HttpResponse(
+                json.dumps({'warn': 'Employee ID is required'}), 
+                status_code=400, 
+                mimetype="application/json"
+            )
+
+        # Parse request body to get the update data
+        try:
+            data = req.get_json()
+        except ValueError:
+            return func.HttpResponse(
+                json.dumps({'error': 'Invalid JSON in request body'}), 
+                status_code=400, 
+                mimetype="application/json"
+            )
+
+        logging.info(f"Processing update for employee ID: {employee_id}")
+
+        # Fetch the existing employee record from Cosmos DB
+        query = "SELECT * FROM c WHERE c.employeeId = @employeeId"
+        parameters = [{"name": "@employeeId", "value": employee_id}]
+        items = list(employee_container.query_items(
+            query=query,
+            parameters=parameters,
+            enable_cross_partition_query=True
+        ))
+
+        if not items:
+            return func.HttpResponse(
+                json.dumps({'error': 'Employee not found'}), 
+                status_code=404, 
+                mimetype="application/json"
+            )
+
+        item = items[0]  # Existing employee record
+
+        # Handle image upload if new image is provided
+        new_image_base64 = data.get('newImageBase64')
+        if new_image_base64:  # Only process if a new image is provided
+            try:
+                # Upload the new image and get its URL
+                new_image_url = upload_image_to_blob(new_image_base64, employee_id)
+
+                if new_image_url:
+                    # If there was a previous image, delete it
+                    if item.get('imageUrl'):
+                        delete_image_from_blob(item['imageUrl'])
+
+                    # Update the image URL in the employee record
+                    item['imageUrl'] = new_image_url
+                    logging.info(f"Updated image URL for employee {employee_id}: {new_image_url}")
+            except Exception as e:
+                logging.error(f"Error handling image upload: {e}")
+                return func.HttpResponse(
+                    json.dumps({'error': f'Error processing image: {str(e)}'}), 
+                    status_code=500, 
+                    mimetype="application/json"
+                )
+        else:
+            logging.info(f"No new image provided. Keeping existing image URL: {item.get('imageUrl')}")
+
+        # Define the allowed fields
+        allowed_fields = {
+            "employeeName", "role", "email", "organizationId", "userId"
+        }
+        # Remove protected fields from the update data
+        protected_fields = {'id', '_rid', '_self', '_etag', '_attachments', '_ts', 'employeeId', 'newImageBase64'}
+        update_data = {k: v for k, v in data.items() if k in allowed_fields and k not in protected_fields}
+
+        # Update the existing employee record with new data
+        item.update(update_data)
+
+        # Azure AD B2C Update Logic
+        b2c_user_id = item.get('azure_b2c_id')
+        if b2c_user_id:
+            # Update user information in Azure AD B2C
+            client_id = os.getenv("AZURE_B2C_CLIENT_ID")
+            client_secret = os.getenv("AZURE_B2C_CLIENT_SECRET")
+            tenant_name = os.getenv("AZURE_B2C_TENANT_NAME")
+            tenant_domain = os.getenv("AZURE_B2C_DOMAIN", f"{tenant_name}.onmicrosoft.com")
+
+            # Get Microsoft Graph token using client credentials flow
+            token_url = f"https://login.microsoftonline.com/{tenant_name}.onmicrosoft.com/oauth2/v2.0/token"
+            token_data = {
+                'client_id': client_id,
+                'client_secret': client_secret,
+                'scope': 'https://graph.microsoft.com/.default',
+                'grant_type': 'client_credentials'
+            }
+
+            token_response = requests.post(
+                token_url,
+                data=token_data,
+                headers={'Content-Type': 'application/x-www-form-urlencoded'}
+            )
+
+            if token_response.status_code != 200:
+                logging.error(f"Token request failed with status {token_response.status_code}")
+                logging.error(f"Response body: {token_response.text}")
+                return func.HttpResponse(
+                    body=json.dumps({
+                        'error': f"Failed to authenticate with Azure AD: {token_response.text}",
+                    }),
+                    status_code=500,
+                    mimetype="application/json"
+                )
+
+            token_result = token_response.json()
+            if "access_token" not in token_result:
+                logging.error(f"Unable to get token: {token_result.get('error')}")
+                return func.HttpResponse(
+                    body=json.dumps({
+                        'error': 'Failed to authenticate with Azure AD',
+                    }),
+                    status_code=500,
+                    mimetype="application/json"
+                )
+
+            graph_url = f"https://graph.microsoft.com/v1.0/users/{b2c_user_id}"
+            headers = {
+                "Authorization": f"Bearer {token_result['access_token']}",
+                "Content-Type": "application/json"
+            }
+
+            # Make PATCH request to update the user in Azure AD B2C
+            update_data_b2c = {
+                "givenName": item.get("employeeName"),
+                "jobTitle": item.get("role"),
+                "mail": item.get("email")
+            }
+
+            update_response = requests.patch(graph_url, headers=headers, json=update_data_b2c)
+
+            if update_response.status_code != 200:
+                logging.error(f"Error updating Azure AD B2C user: Status {update_response.status_code}")
+                logging.error(f"Response: {update_response.text}")
+                return func.HttpResponse(
+                    body=json.dumps({
+                        'error': f"Failed to update user in Azure AD B2C: {update_response.text}"
+                    }),
+                    status_code=500,
+                    mimetype="application/json"
+                )
+
+            logging.info(f"Employee {employee_id} updated successfully in Azure AD B2C.")
+
+        # Replace the employee record in Cosmos DB
+        try:
+            employee_container.replace_item(
+                item=item['id'],
+                body=item
+            )
+            logging.info(f"Employee {employee_id} updated successfully in Cosmos DB.")
+        except exceptions.CosmosHttpResponseError as e:
+            logging.error(f"Error updating employee in Cosmos DB: {e}")
+
+            # Clean up the newly uploaded image in case of an error
+            if new_image_base64 and 'new_image_url' in locals():
+                delete_image_from_blob(new_image_url)
+
+            return func.HttpResponse(
+                json.dumps({'error': 'Failed to update employee record'}), 
+                status_code=500, 
+                mimetype="application/json"
+            )
+
+        # Return the updated employee data as the response
+        return func.HttpResponse(
+            json.dumps({
+                'message': 'Employee updated successfully',
+                'data': item
+            }),
+            status_code=200,
+            mimetype="application/json"
+        )
+
+    except Exception as e:
+        logging.error(f"Unexpected error in update_employee: {e}")
+        return func.HttpResponse(
+            json.dumps({'error': str(e)}),
+            status_code=500,
+            mimetype="application/json"
+        )
