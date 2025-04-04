@@ -313,34 +313,34 @@ class CameraUrls(BaseModel):
 
     
                                 # Fetch all employee records -getall
-@app.function_name(name="get_all_employees")
-@app.route(route='employees', methods=[func.HttpMethod.GET])
-@require_auth
-async def get_all_employees(req: func.HttpRequest) -> func.HttpResponse:
-    try:
-        logging.info(f"Token validated for user: {req.user_info.get('email', 'unknown')}")
+# @app.function_name(name="get_all_employees")
+# @app.route(route='employees', methods=[func.HttpMethod.GET])
+# @require_auth
+# async def get_all_employees(req: func.HttpRequest) -> func.HttpResponse:
+#     try:
+#         logging.info(f"Token validated for user: {req.user_info.get('email', 'unknown')}")
 
-        # Proceed with the rest of the logic
-        page_number = int(req.params.get('page_number', 1))
-        page_size = int(req.params.get('page_size', 10))
-        offset = (page_number - 1) * page_size
+#         # Proceed with the rest of the logic
+#         page_number = int(req.params.get('page_number', 1))
+#         page_size = int(req.params.get('page_size', 10))
+#         offset = (page_number - 1) * page_size
 
-        query = "SELECT * FROM c"
-        all_items = list(employee_container.query_items(query=query, enable_cross_partition_query=True))
-        paginated_items = all_items[offset:offset + page_size]
+#         query = "SELECT * FROM c"
+#         all_items = list(employee_container.query_items(query=query, enable_cross_partition_query=True))
+#         paginated_items = all_items[offset:offset + page_size]
 
-        return func.HttpResponse(
-            body=json.dumps(paginated_items),
-            status_code=200,
-            mimetype="application/json"
-        )
-    except Exception as e:
-        logging.error(f"Error fetching employees: {str(e)}")
-        return func.HttpResponse(
-            body=json.dumps({'error': str(e)}),
-            status_code=500,
-            mimetype="application/json"
-        )
+#         return func.HttpResponse(
+#             body=json.dumps(paginated_items),
+#             status_code=200,
+#             mimetype="application/json"
+#         )
+#     except Exception as e:
+#         logging.error(f"Error fetching employees: {str(e)}")
+#         return func.HttpResponse(
+#             body=json.dumps({'error': str(e)}),
+#             status_code=500,
+#             mimetype="application/json"
+#         )
 
 
 
@@ -1013,10 +1013,8 @@ async def search_employee(req: func.HttpRequest) -> func.HttpResponse:
 
         # If no items found, return a 404 response
         return func.HttpResponse(
-            body=json.dumps({
-                'message': 'No employees found matching the search criteria'
-            }),
-            status_code=404,
+            body=json.dumps([]),
+            status_code=200,
             mimetype="application/json"
         )
 
@@ -3644,6 +3642,16 @@ async def add_employee(req: func.HttpRequest) -> func.HttpResponse:
                 status_code=400,
                 mimetype="application/json"
             )
+         # Check if email already exists in Cosmos DB
+        email_query = f"SELECT * FROM c WHERE c.email = '{email}'"
+        existing_email = list(employee_container.query_items(query=email_query, enable_cross_partition_query=True))
+
+        if existing_email:
+            return func.HttpResponse(
+                body=json.dumps({'error': f'Email {email} is already in use'}),
+                status_code=409,  # Conflict
+                mimetype="application/json"
+            )
 
         # Validate image format if image is provided
         if image_name:
@@ -4268,6 +4276,170 @@ async def update_employee(req: func.HttpRequest) -> func.HttpResponse:
         logging.error(f"Unexpected error in update_employee: {e}")
         return func.HttpResponse(
             json.dumps({'error': str(e)}),
+            status_code=500,
+            mimetype="application/json"
+        )
+
+
+# search user-Tracker
+@app.function_name(name="searchUsers")
+@app.route(route='api/searchUsers', methods=[func.HttpMethod.GET])
+@require_auth
+async def search_users(req: func.HttpRequest) -> func.HttpResponse:
+    user_info = req.user_info
+    organization_id = user_info['sub']
+   
+    try:
+        # Get single search parameter
+        search_term = req.params.get('search', '').lower().strip()
+       
+        # Debug logging
+        logging.info(f"Searching users for organization_id: {organization_id}, search_term: {search_term}")
+       
+        # Base query with organization filter
+        query = "SELECT * FROM c WHERE c.organization_id = @org_id"
+        query_params = [{"name": "@org_id", "value": organization_id}]
+       
+        valid_roles = ['user', 'admin']
+       
+        # Parse search term
+        name_filter = search_term
+        role_filter = None
+       
+        words = search_term.split()
+        for word in words:
+            if word in valid_roles:
+                detected_role = word.capitalize()
+                role_filter = detected_role
+                name_filter = search_term.replace(word, '').strip()
+                break
+       
+        if name_filter:
+            query += " AND LOWER(c.name) LIKE @name"
+            query_params.append({"name": "@name", "value": f"%{name_filter}%"})
+           
+        if role_filter:
+            query += " AND c.role = @role"
+            query_params.append({"name": "@role", "value": role_filter})
+       
+        query_options = {
+            'enable_cross_partition_query': True
+        }
+       
+        # Inner try block for database query
+        try:
+            items = list(users_container.query_items(
+                query=query,
+                parameters=query_params,
+                **query_options
+            ))
+           
+            logging.info(f"Query returned {len(items)} items")
+           
+            if not items:
+                logging.info("No matching users found with specified criteria")
+           
+            # Process users
+            users = []
+            for user in items:
+                if 'passwordHash' in user:
+                    del user['passwordHash']
+               
+                clean_user = {
+                    'id': user.get('id'),
+                    'name': user.get('name'),
+                    'email': user.get('email'),
+                    'role': user.get('role'),
+                    'created_at': user.get('created_at'),
+                    'updated_at': user.get('updated_at', user.get('created_at')),
+                    'organization_id': user.get('organization_id')
+                }
+                users.append(clean_user)
+               
+        except Exception as e:
+            logging.error(f"Cosmos DB Error: {str(e)}")
+            return func.HttpResponse(
+                json.dumps({"detail": f"Database error: {str(e)}"}),
+                mimetype="application/json",
+                status_code=500
+            )
+       
+        # Prepare response
+        response = {
+            "data": {
+                "users": users,
+                "count": len(users),
+                "search_criteria": {
+                    "search_term": search_term if search_term else None,
+                    "detected_name": name_filter if name_filter else None,
+                    "detected_role": role_filter if role_filter else None,
+                    "organization_id": organization_id
+                }
+            }
+        }
+       
+        return func.HttpResponse(
+            json.dumps(response),
+            mimetype="application/json",
+            status_code=200
+        )
+   
+    except Exception as e:  # Outer try block needs an except clause
+        logging.error(f"Unexpected error: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"detail": f"An unexpected error occurred: {str(e)}"}),
+            mimetype="application/json",
+            status_code=500
+        )
+ 
+# getall employees organization(id) based
+
+@app.function_name(name="get_all_employees")
+@app.route(route='employees', methods=[func.HttpMethod.GET])
+@require_auth
+async def get_all_employees(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        logging.info(f"Token validated for user: {req.user_info.get('email', 'unknown')}")
+
+        # Extract organizationId (sub) from token
+        organization_id = req.user_info.get('sub')
+
+        if not organization_id:
+            logging.error("Invalid token: organizationId (sub) missing")
+            return func.HttpResponse(
+                json.dumps({"error": "Invalid token: organizationId (sub) missing"}),
+                status_code=401,
+                mimetype="application/json"
+            )
+
+        # Pagination parameters
+        page_number = int(req.params.get('page_number', 1))
+        page_size = int(req.params.get('page_size', 10))
+        offset = (page_number - 1) * page_size
+
+        # Query employees based on organizationId
+        query = "SELECT * FROM c WHERE c.organizationId = @organizationId"
+        parameters = [{"name": "@organizationId", "value": organization_id}]
+
+        employees = list(employee_container.query_items(
+            query=query,
+            parameters=parameters,
+            enable_cross_partition_query=True
+        ))
+
+        # Apply pagination
+        paginated_items = employees[offset:offset + page_size]
+
+        return func.HttpResponse(
+            body=json.dumps(paginated_items),
+            status_code=200,
+            mimetype="application/json"
+        )
+
+    except Exception as e:
+        logging.error(f"Error fetching employees for organizationId {organization_id}: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({'error': "Internal server error"}),
             status_code=500,
             mimetype="application/json"
         )
