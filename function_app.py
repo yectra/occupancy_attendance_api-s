@@ -36,6 +36,8 @@ from urllib.parse import quote
 from azure.identity import ClientSecretCredential
 from azure.core.exceptions import HttpResponseError
 import urllib.parse
+from sendgrid import SendGridAPIClient
+from sendgrid.helpers.mail import Mail, From, To
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
 
@@ -72,12 +74,20 @@ POLICY_NAME = os.getenv('AZURE_B2C_POLICY_NAME')
 CLIENT_ID = os.getenv('AZURE_B2C_CLIENT_ID')
 TENANT_ID = os.getenv("AZURE_B2C_TENANT_ID")
 CLIENT_SECRET = os.getenv("AZURE_B2C_CLIENT_SECRET")
+# container(tracker)
 USER_COUNTS=os.getenv('USER_COUNTS')
 USER_LOGS=os.getenv('USER_LOGS')
 USERS=os.getenv('USERS')
+
+#notifications_email(sendgrid)
+SENDGRID_API_KEY = os.getenv('SENDGRID_API_KEY')
+SENDGRID_TEMPLATE_ID = os.getenv('SENDGRID_TEMPLATE_ID')
+FROM_EMAIL = os.getenv('FROM_EMAIL')
+
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)  # Set the logging level to DEBUG
 
+# Storage_blob_configs
 STORAGE_ACCOUNT_NAME = os.getenv('STORAGE_ACCOUNT_NAME')
 STORAGE_CONTAINER_NAME=os.getenv('STORAGE_CONTAINER_NAME')
 # Initialize the Cosmos client
@@ -145,7 +155,8 @@ def decode_jwt(token: str):
             key=key_dict[kid],
             algorithms=["RS256"],
             audience=AZURE_B2C_CLIENT_ID,
-            issuer=B2C_ISSUER
+            issuer=B2C_ISSUER,
+            leeway=200
         )
 
          # Log token issue time (iat) and current UTC time
@@ -250,7 +261,7 @@ async def get_employee(req: func.HttpRequest) -> func.HttpResponse:
     if not employee_id:
         logging.error("Employee ID missing in request.")
         return func.HttpResponse(
-            json.dumps({"error": "Employee ID missing in request"}),
+            json.dumps({"warn": "Employee ID missing in request"}),
             status_code=400,
             mimetype="application/json"
         )
@@ -274,7 +285,7 @@ async def get_employee(req: func.HttpRequest) -> func.HttpResponse:
 
         logging.warning(f"No employee found with ID: {employee_id}")
         return func.HttpResponse(
-            json.dumps({'message': 'Employee not found'}),
+            json.dumps({'warn': 'Employee not found'}),
             status_code=404,
             mimetype="application/json"
         )
@@ -282,7 +293,7 @@ async def get_employee(req: func.HttpRequest) -> func.HttpResponse:
     except Exception as e:
         logging.error(f"Error fetching employee with ID {employee_id}: {str(e)}")
         return func.HttpResponse(
-            json.dumps({'error': "Internal server error"}),
+            json.dumps({'warn': "Internal server error"}),
             status_code=500,
             mimetype="application/json"
         )
@@ -371,20 +382,20 @@ async def search_attendance(req: func.HttpRequest) -> func.HttpResponse:
             page_size = int(page_size)
             if page_number < 1 or page_size < 1:
                 return func.HttpResponse(
-                    body=json.dumps({'error': 'page_number and page_size must be positive integers'}),
+                    body=json.dumps({'warn': 'page_number and page_size must be positive integers'}),
                     status_code=400,
                     mimetype="application/json"
                 )
         except ValueError:
             return func.HttpResponse(
-                body=json.dumps({'error': 'Invalid page_number or page_size. They must be integers.'}),
+                body=json.dumps({'warn': 'Invalid page_number or page_size. They must be integers.'}),
                 status_code=400,
                 mimetype="application/json"
             )
 
         if not (employee_id or employee_name or date):
             return func.HttpResponse(
-                body=json.dumps({'error': 'At least one search parameter (employeeId, employeeName, or date) is required'}),
+                body=json.dumps({'warn': 'At least one search parameter (employeeId, employeeName, or date) is required'}),
                 status_code=400,
                 mimetype="application/json"
             )
@@ -423,7 +434,7 @@ async def search_attendance(req: func.HttpRequest) -> func.HttpResponse:
             )
 
         return func.HttpResponse(
-            body=json.dumps({'message': 'No matching attendance records found'}),
+            body=json.dumps({'warn': 'No matching attendance records found'}),
             status_code=404,
             mimetype="application/json"
         )
@@ -431,7 +442,7 @@ async def search_attendance(req: func.HttpRequest) -> func.HttpResponse:
     except exceptions.CosmosHttpResponseError as e:
         logging.error(f"Failed to search attendance records: {str(e)}")
         return func.HttpResponse(
-            body=json.dumps({'error': f'Failed to search attendance records: {e.message}'}),
+            body=json.dumps({'warn': f'Failed to search attendance records: {e.message}'}),
             status_code=500,
             mimetype="application/json"
         )
@@ -856,69 +867,80 @@ def fetch_employee_image(employee_id):
         return None
 
 
-@app.function_name(name="get_all_attendance")
-@app.route(route='attendance/all', methods=[func.HttpMethod.GET])
-@require_auth
-async def get_all_attendance(req: func.HttpRequest) -> func.HttpResponse:
-    """
-    Retrieve attendance records with optional filtering by employeeId and date.
-    Includes pagination and sorting by date (latest first).
-    """
-    logging.info(f"Token validated for user: {req.user_info.get('email', 'unknown')}")
+# @app.function_name(name="get_all_attendance")
+# @app.route(route='attendance/all', methods=[func.HttpMethod.GET])
+# @require_auth
+# async def get_all_attendance(req: func.HttpRequest) -> func.HttpResponse:
+#     """
+#     Retrieve attendance records by organizationId with optional filtering by employeeId and date.
+#     Includes pagination and sorting by date (latest first).
+#     """
+#     logging.info(f"Token validated for user: {req.user_info.get('email', 'unknown')}")
 
-    try:
-        # Extract pagination parameters (default: page 1, size 10)
-        page_number = int(req.params.get('page_number', 1))
-        page_size = int(req.params.get('page_size', 10))
-        offset = (page_number - 1) * page_size
+#     try:
+#         # Extract organizationId from user info (sub)
+#         user_info = req.user_info
+#         organization_id = user_info.get("sub")  # This should be the actual org ID
 
-        # Get optional filters
-        employee_id = req.params.get('employeeId')
-        attendance_date = req.params.get('date')  # Expected format: YYYY-MM-DD
+#         if not organization_id:
+#             return func.HttpResponse(
+#                 body=json.dumps({'error': 'Unauthorized. Missing organization ID.'}),
+#                 status_code=401,
+#                 mimetype="application/json"
+#             )
 
-        # Base query
-        query = "SELECT * FROM c WHERE 1=1"
-        parameters = []
+#         # Pagination parameters
+#         page_number = int(req.params.get('page_number', 1))
+#         page_size = int(req.params.get('page_size', 10))
+#         offset = (page_number - 1) * page_size
 
-        # Apply employeeId filter if provided
-        if employee_id:
-            query += " AND c.employeeId = @employeeId"
-            parameters.append({"name": "@employeeId", "value": employee_id})
+#         # Optional filters
+#         employee_id = req.params.get('employeeId')
+#         attendance_date = req.params.get('date')  # Format: YYYY-MM-DD
 
-        # Apply date filter if provided
-        if attendance_date:
-            query += " AND c.date = @attendanceDate"
-            parameters.append({"name": "@attendanceDate", "value": attendance_date})
+#         # Base query with organization filter
+#         query = "SELECT * FROM c WHERE c.organizationId = @orgId"
+#         parameters = [{"name": "@orgId", "value": organization_id}]
 
-        # Sort by date (descending) so latest records appear first
-        query += " ORDER BY c.date DESC"
+#         if employee_id:
+#             query += " AND c.employeeId = @employeeId"
+#             parameters.append({"name": "@employeeId", "value": employee_id})
 
-        # Execute query
-        all_items = list(attendance_container.query_items(
-            query=query, parameters=parameters, enable_cross_partition_query=True
-        ))
+#         if attendance_date:
+#             query += " AND c.date = @attendanceDate"
+#             parameters.append({"name": "@attendanceDate", "value": attendance_date})
 
-        # Apply pagination
-        paginated_items = all_items[offset:offset + page_size]
+#         query += " ORDER BY c.date DESC"
 
-        return func.HttpResponse(
-            body=json.dumps({
-                "page_number": page_number,
-                "page_size": page_size,
-                "total_records": len(all_items),
-                "data": paginated_items
-            }),
-            status_code=200,
-            mimetype="application/json"
-        )
+#         # Query Cosmos DB
+#         all_items = list(attendance_container.query_items(
+#             query=query,
+#             parameters=parameters,
+#             enable_cross_partition_query=True
+#         ))
 
-    except Exception as e:
-        logging.error(f"Error fetching attendance records: {str(e)}")
-        return func.HttpResponse(
-            body=json.dumps({'error': 'Internal Server Error'}),
-            status_code=500,
-            mimetype="application/json"
-        )
+#         # Paginate results
+#         paginated_items = all_items[offset:offset + page_size]
+
+#         return func.HttpResponse(
+#             body=json.dumps({
+#                 "page_number": page_number,
+#                 "page_size": page_size,
+#                 "total_records": len(all_items),
+#                 "data": paginated_items
+#             }),
+#             status_code=200,
+#             mimetype="application/json"
+#         )
+
+#     except Exception as e:
+#         logging.error(f"Error fetching attendance records: {str(e)}")
+#         return func.HttpResponse(
+#             body=json.dumps({'error': 'Internal Server Error'}),
+#             status_code=500,
+#             mimetype="application/json"
+#         )
+
 
 
 
@@ -962,7 +984,7 @@ async def search_employee(req: func.HttpRequest) -> func.HttpResponse:
     if not search:
         return func.HttpResponse(
             body=json.dumps({
-                'error': 'A search parameter is required'
+                'warn': 'A search parameter is required'
             }),
             status_code=400,
             mimetype="application/json"
@@ -1023,7 +1045,7 @@ async def search_employee(req: func.HttpRequest) -> func.HttpResponse:
         logging.error(f"Failed to search employee records: {str(e)}")
         return func.HttpResponse(
             body=json.dumps({
-                'error': f'Failed to search employee records: {str(e)}'
+                'warn': f'Failed to search employee records: {str(e)}'
             }),
             status_code=500,
             mimetype="application/json"
@@ -1033,7 +1055,7 @@ async def search_employee(req: func.HttpRequest) -> func.HttpResponse:
         logging.error(f"Unexpected error in search_employee: {str(e)}")
         return func.HttpResponse(
             body=json.dumps({
-                'error': 'An unexpected error occurred during employee search'
+                'warn': 'An unexpected error occurred during employee search'
             }),
             status_code=500,
             mimetype="application/json"
@@ -1073,7 +1095,7 @@ async def saveCameraUrls(req: func.HttpRequest) -> func.HttpResponse:
         organization_id = req.user_info.get('user_id')
         if not organization_id:
             return func.HttpResponse(
-                json.dumps({'error': 'Invalid token: organizationId (sub) missing'}),
+                json.dumps({'warn': 'Invalid token: organizationId (sub) missing'}),
                 status_code=401,
                 mimetype="application/json"
             )
@@ -1085,7 +1107,7 @@ async def saveCameraUrls(req: func.HttpRequest) -> func.HttpResponse:
         email = req_body.get("email") or req.user_info.get("email", "")
         if not email or not re.match(EMAIL_REGEX, email):
             return func.HttpResponse(
-                json.dumps({"error": "Invalid email format."}),
+                json.dumps({"warn": "Invalid email format."}),
                 status_code=400
             )
 
@@ -1093,7 +1115,7 @@ async def saveCameraUrls(req: func.HttpRequest) -> func.HttpResponse:
         new_camera_details = req_body.get("cameraDetails", [])
         if not new_camera_details or not isinstance(new_camera_details, list):
             return func.HttpResponse(
-                json.dumps({"detail": "Missing or invalid field: 'cameraDetails'."}),
+                json.dumps({"warn": "Missing or invalid field: 'cameraDetails'."}),
                 status_code=400
             )
 
@@ -1114,7 +1136,7 @@ async def saveCameraUrls(req: func.HttpRequest) -> func.HttpResponse:
             required_keys = ["punchinCamera", "punchinUrl", "punchoutCamera", "punchoutUrl"]
             if not all(key in detail for key in required_keys):
                 return func.HttpResponse(
-                    json.dumps({"detail": f"Each item in 'cameraDetails' must contain {required_keys}."}),
+                    json.dumps({"warn": f"Each item in 'cameraDetails' must contain {required_keys}."}),
                     status_code=400
                 )
 
@@ -1123,7 +1145,7 @@ async def saveCameraUrls(req: func.HttpRequest) -> func.HttpResponse:
                 url = detail[key]
                 if not any(url.startswith(scheme + "://") for scheme in ALLOWED_URL_SCHEMES):
                     return func.HttpResponse(
-                        json.dumps({"error": f"Invalid {key} format. Allowed formats: {', '.join(ALLOWED_URL_SCHEMES)}."}),
+                        json.dumps({"warn": f"Invalid {key} format. Allowed formats: {', '.join(ALLOWED_URL_SCHEMES)}."}),
                         status_code=400
                     )
 
@@ -1161,7 +1183,7 @@ async def saveCameraUrls(req: func.HttpRequest) -> func.HttpResponse:
     except Exception as e:
         logging.error(f"Error processing request: {str(e)}")
         return func.HttpResponse(
-            json.dumps({"detail": "An error occurred during processing."}),
+            json.dumps({"warn": "An error occurred during processing."}),
             status_code=500
         )
 
@@ -1191,7 +1213,7 @@ async def updateCameraUrls(req: func.HttpRequest) -> func.HttpResponse:
     except Exception as e:
         logging.error(f"Unauthorized Request: {str(e)}")
         return func.HttpResponse(
-            json.dumps({"error": "Unauthorized: Missing or Invalid Token"}),
+            json.dumps({"warn": "Unauthorized: Missing or Invalid Token"}),
             status_code=401,
             mimetype="application/json"
         )
@@ -1205,7 +1227,7 @@ async def updateCameraUrls(req: func.HttpRequest) -> func.HttpResponse:
         
         if not camera_id:
             return func.HttpResponse(
-                json.dumps({"detail": "Missing required field: 'id'."}),
+                json.dumps({"warn": "Missing required field: 'id'."}),
                 status_code=400
             )
         
@@ -1214,7 +1236,7 @@ async def updateCameraUrls(req: func.HttpRequest) -> func.HttpResponse:
 
         if not camera_details:
             return func.HttpResponse(
-                json.dumps({"detail": "Missing required field: 'cameraDetails'."}),
+                json.dumps({"warn": "Missing required field: 'cameraDetails'."}),
                 status_code=400
             )
 
@@ -1223,7 +1245,7 @@ async def updateCameraUrls(req: func.HttpRequest) -> func.HttpResponse:
 
         if not existing_data:
             return func.HttpResponse(
-                json.dumps({"detail": f"No camera data found for ID: {camera_id}."}),
+                json.dumps({"warn": f"No camera data found for ID: {camera_id}."}),
                 status_code=404
             )
 
@@ -1239,7 +1261,7 @@ async def updateCameraUrls(req: func.HttpRequest) -> func.HttpResponse:
         for detail in camera_details:
             if not isinstance(detail, dict):
                 return func.HttpResponse(
-                    json.dumps({"detail": "Invalid format in 'cameraDetails'. Expected list of objects."}),
+                    json.dumps({"warn": "Invalid format in 'cameraDetails'. Expected list of objects."}),
                     status_code=400
                 )
 
@@ -1249,7 +1271,7 @@ async def updateCameraUrls(req: func.HttpRequest) -> func.HttpResponse:
             # Ensure all required fields exist
             if set(filtered_detail.keys()) != allowed_fields:
                 return func.HttpResponse(
-                    json.dumps({"detail": "Invalid or missing fields in 'cameraDetails'. Only specific fields are allowed."}),
+                    json.dumps({"warn": "Invalid or missing fields in 'cameraDetails'. Only specific fields are allowed."}),
                     status_code=400
                 )
 
@@ -1269,12 +1291,12 @@ async def updateCameraUrls(req: func.HttpRequest) -> func.HttpResponse:
 
     except ValueError:
         return func.HttpResponse(
-            json.dumps({"detail": "Invalid JSON format."}),
+            json.dumps({"warn": "Invalid JSON format."}),
             status_code=400
         )
     except Exception as e:
         return func.HttpResponse(
-            json.dumps({"detail": str(e)}),
+            json.dumps({"warn": str(e)}),
             status_code=500
         )
 
@@ -1294,7 +1316,7 @@ async def getCameraUrlById(req: func.HttpRequest) -> func.HttpResponse:
         # Check if the 'id' key is present
         if not camera_id:
             return func.HttpResponse(
-                json.dumps({"detail": "Missing required parameter: 'id'."}),
+                json.dumps({"warn": "Missing required parameter: 'id'."}),
                 status_code=400
             )
 
@@ -1309,13 +1331,13 @@ async def getCameraUrlById(req: func.HttpRequest) -> func.HttpResponse:
         )
     except exceptions.CosmosResourceNotFoundError:
         return func.HttpResponse(
-            json.dumps({"detail": "Camera details not found for the provided ID."}),
+            json.dumps({"warn": "Camera details not found for the provided ID."}),
             status_code=404
         )
     except Exception as e:
         logging.error(f"Error retrieving camera details: {str(e)}")
         return func.HttpResponse(
-            json.dumps({"detail": "An error occurred while retrieving the data."}),
+            json.dumps({"warn": "An error occurred while retrieving the data."}),
             status_code=500
         )
 
@@ -1339,7 +1361,7 @@ async def add_organization(req: func.HttpRequest) -> func.HttpResponse:
         json_data = req.get_json()
         if not json_data:
             return func.HttpResponse(
-                json.dumps({'error': 'JSON data is required in the request body'}),
+                json.dumps({'warn': 'JSON data is required in the request body'}),
                 status_code=400,
                 mimetype="application/json"
             )
@@ -1348,41 +1370,63 @@ async def add_organization(req: func.HttpRequest) -> func.HttpResponse:
         organization_name = json_data.get('organizationName')
         phone_number = json_data.get('phoneNumber')
         website_url = json_data.get('websiteUrl')
-        address = json_data.get('address')
+        # address = json_data.get('address')
+        street = json_data.get('street')
+        city = json_data.get('city')
+        state = json_data.get('state')
+        zip_code = json_data.get('zipCode')
+        country = json_data.get('country')
         work_timing = json_data.get('workTiming')  # Extract workTiming
+        
+        try:
+             # Convert workTiming to an integer if provided
+            work_timing = int(work_timing) if work_timing else None
+            if work_timing is not None and (work_timing < 0 or work_timing > 24):
+                return func.HttpResponse(
+                    json.dumps({'warn': 'workTiming must be between 0 and 24 hours'}),
+                    status_code=400,
+                    mimetype="application/json"
+                )
+        except ValueError:
+            return func.HttpResponse(
+                json.dumps({'warn': 'workTiming must be a valid integer'}),
+                status_code=400,
+                mimetype="application/json"
+            )
 
         # Validate required fields
         if not organization_name:
             return func.HttpResponse(
-                json.dumps({'error': 'Organization name is mandatory'}),
+                json.dumps({'warn': 'Organization name is mandatory'}),
                 status_code=400,
                 mimetype="application/json"
             )
 
-        # Convert workTiming to an integer if provided
-        try:
-            work_timing = int(work_timing) if work_timing else None
-        except ValueError:
-            return func.HttpResponse(
-                json.dumps({'error': 'workTiming must be a valid integer'}),
-                status_code=400,
-                mimetype="application/json"
-            )
 
         # Validate phone number (only digits with optional + at the beginning, 10-15 digits)
         phone_number_pattern = r'^\+?\d{10,15}$'
         if phone_number and not re.match(phone_number_pattern, phone_number):
             return func.HttpResponse(
-                json.dumps({'error': 'Invalid phone number. Must be 10-15 digits, with optional + at the start.'}),
+                json.dumps({'warn': 'Invalid phone number. Must be 10-15 digits, with optional + at the start.'}),
                 status_code=400,
                 mimetype="application/json"
             )
 
         # Validate website URL format
-        valid_domain_pattern = r'^(https?://)?(www\.)?[\w-]+\.(com|net|org|io|co|edu|gov|info|biz|dev|app)$'
-        if website_url and not re.match(valid_domain_pattern, website_url):
+        valid_domain_pattern = r'^(https?://)?(www\.)?[\w-]+\.(com|net|org|io|co|edu|gov|info|biz|dev|app|in)$'
+        if website_url:
+            if not re.match(valid_domain_pattern, website_url):
+                return func.HttpResponse(
+                    json.dumps({'warn': 'Invalid website URL format. Must be like https://example.com'}),
+                    status_code=400,
+                    mimetype="application/json"
+                )
+
+        # Extra check: Prevent repeated TLDs like '.in.in'
+        tld_repetition_pattern = r'\.(com|net|org|io|co|edu|gov|info|biz|dev|app|in)\.\1$'
+        if re.search(tld_repetition_pattern, website_url):
             return func.HttpResponse(
-                json.dumps({'error': 'Invalid website URL format. Must be like https://example.com'}),
+                json.dumps({'warn': 'Invalid website URL: repeated TLDs are not allowed'}),
                 status_code=400,
                 mimetype="application/json"
             )
@@ -1391,7 +1435,7 @@ async def add_organization(req: func.HttpRequest) -> func.HttpResponse:
         organization_id = req.user_info.get('user_id')
         if not organization_id:
             return func.HttpResponse(
-                json.dumps({'error': 'Invalid token: user ID (sub) missing'}),
+                json.dumps({'warn': 'Invalid token: user ID (sub) missing'}),
                 status_code=401,
                 mimetype="application/json"
             )
@@ -1406,7 +1450,7 @@ async def add_organization(req: func.HttpRequest) -> func.HttpResponse:
 
         if existing_organizations:
             return func.HttpResponse(
-                json.dumps({'error': 'Organization name already exists'}),
+                json.dumps({'warn': 'Organization name already exists'}),
                 status_code=409,
                 mimetype="application/json"
             )
@@ -1418,10 +1462,24 @@ async def add_organization(req: func.HttpRequest) -> func.HttpResponse:
             'organizationName': organization_name,
             'phoneNumber': phone_number,
             'websiteUrl': website_url,
-            'address': address,
+            # 'address': address,
+            'street': street,
+            'city': city,
+            'state': state,
+            'zipCode': zip_code,
+            'country': country,
             'workTiming': work_timing,  # Store as an integer
             'createdAt': datetime.utcnow().isoformat(),
         }
+
+        required_fields = [street, city, state, zip_code, country]
+        if not all(required_fields):
+            return func.HttpResponse(
+                json.dumps({'warn': 'All address fields (street, city, state, zipCode, country) are required'}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
 
         # Use `upsert_item()` to avoid conflicts
         organization_container_name.upsert_item(organization_record)
@@ -1435,7 +1493,7 @@ async def add_organization(req: func.HttpRequest) -> func.HttpResponse:
     except Exception as e:
         logging.error(f"Error adding organization: {str(e)}")
         return func.HttpResponse(
-            json.dumps({'error': 'Internal Server Error'}),
+            json.dumps({'warn': 'Internal Server Error'}),
             status_code=500,
             mimetype="application/json"
         )
@@ -1562,28 +1620,28 @@ def require_auth(func):
         auth_header = req.headers.get('Authorization')
         if not auth_header:
             return HttpResponse(
-                json.dumps({"detail": "Authorization token is required."}),
+                json.dumps({"warn": "Authorization token is required."}),
                 status_code=401
             )
  
         try:
             if not auth_header.startswith('Bearer '):
                 return HttpResponse(
-                    json.dumps({"detail": "Invalid authorization header format. Must start with 'Bearer'."}),
+                    json.dumps({"warn": "Invalid authorization header format. Must start with 'Bearer'."}),
                     status_code=401
                 )
  
             token = auth_header[7:]
             if not token:
                 return HttpResponse(
-                    json.dumps({"detail": "Token not found in authorization header."}),
+                    json.dumps({"warn": "Token not found in authorization header."}),
                     status_code=401
                 )
  
             user_info = validate_jwt_token(token)
             if not user_info:
                 return HttpResponse(
-                    json.dumps({"detail": "Invalid token."}),
+                    json.dumps({"warn": "Invalid token."}),
                     status_code=401
                 )
  
@@ -1593,7 +1651,7 @@ def require_auth(func):
         except Exception as e:
             logging.error(f"Authentication error: {str(e)}")
             return HttpResponse(
-                json.dumps({"detail": "Authentication failed."}),
+                json.dumps({"warn": "Authentication failed."}),
                 status_code=500
             )
  
@@ -1633,7 +1691,7 @@ async def authenticated_save_data(req: func.HttpRequest) -> func.HttpResponse:
             # If data already exists, return a message to use edit API instead
             return func.HttpResponse(
                 json.dumps({
-                    "message": "Data already exists. Use the edit API to update.",
+                    "warn": "Data already exists. Use the edit API to update.",
                     "documentId": existing_items[0]["id"]
                 }),
                 status_code=409
@@ -1664,7 +1722,7 @@ async def authenticated_save_data(req: func.HttpRequest) -> func.HttpResponse:
     except Exception as e:
         logging.error(f"Error processing request: {str(e)}")
         return func.HttpResponse(
-            json.dumps({"detail": f"An error occurred during processing: {str(e)}"}),
+            json.dumps({"warn": f"An error occurred during processing: {str(e)}"}),
             status_code=500
         )
  
@@ -1678,9 +1736,30 @@ async def authenticated_save_data(req: func.HttpRequest) -> func.HttpResponse:
 @require_auth
 async def getCameraUrls(req: func.HttpRequest) -> func.HttpResponse:
     user_info = req.user_info
-    organization_id = user_info['sub']
- 
+    user_id = user_info['sub']
+   
+    # Initialize containers
+    users_container = database.get_container_client(USERS)
+   
     try:
+        # First check users container
+        user_query = "SELECT c.organization_id FROM c WHERE c.azure_b2c_id = @user_id"
+        user_params = [{"name": "@user_id", "value": user_id}]
+       
+        user_items = list(users_container.query_items(
+            query=user_query,
+            parameters=user_params,
+            enable_cross_partition_query=True
+        ))
+       
+        # Determine organization_id to use
+        if user_items and len(user_items) > 0 and 'organization_id' in user_items[0]:
+            organization_id = user_items[0]['organization_id']
+        else:
+            # Fallback to using sub directly as organization_id
+            organization_id = user_id
+ 
+        # Query setup-details with the determined organization_id
         query = "SELECT c FROM c WHERE c.organization_id = @organization_id"
         parameters = [{"name": "@organization_id", "value": organization_id}]
        
@@ -1694,7 +1773,7 @@ async def getCameraUrls(req: func.HttpRequest) -> func.HttpResponse:
             # Get the document
             doc = items[0]
            
-            # Check if 'c' key exists in the document (based on your original data structure)
+            # Check if 'c' key exists in the document
             if 'c' in doc:
                 c_data = doc['c']
                 filtered_data = {
@@ -1725,7 +1804,7 @@ async def getCameraUrls(req: func.HttpRequest) -> func.HttpResponse:
     except Exception as e:
         logging.error(f"Error retrieving data: {str(e)}")
         return func.HttpResponse(
-            json.dumps({"detail": "An error occurred while retrieving the data."}),
+            json.dumps({"warn": "An error occurred while retrieving the data."}),
             status_code=500
         )
    
@@ -1737,14 +1816,34 @@ async def get_person_detection_over_time(req: func.HttpRequest) -> func.HttpResp
     user_info = req.user_info
     user_id = user_info['sub']
  
+    # Initialize containers
+    users_container = database.get_container_client(USERS)
+   
     try:
-        # Query to get capacity from setup container
+        # First check users container for organization_id
+        user_query = "SELECT c.organization_id FROM c WHERE c.azure_b2c_id = @user_id"
+        user_params = [{"name": "@user_id", "value": user_id}]
+       
+        user_items = list(users_container.query_items(
+            query=user_query,
+            parameters=user_params,
+            enable_cross_partition_query=True
+        ))
+       
+        # Determine organization_id to use
+        if user_items and len(user_items) > 0 and 'organization_id' in user_items[0]:
+            organization_id = user_items[0]['organization_id']
+        else:
+            # Fallback to using sub directly as organization_id
+            organization_id = user_id
+ 
+        # Query to get capacity from setup container using organization_id
         capacity_query = """
         SELECT c.capacityOfPeople
         FROM c
-        WHERE c.user_id = @user_id
+        WHERE c.organization_id = @organization_id
         """
-        parameters = [{"name": "@user_id", "value": user_id}]
+        parameters = [{"name": "@organization_id", "value": organization_id}]
        
         setup_items = list(setup_container.query_items(
             query=capacity_query,
@@ -1761,15 +1860,15 @@ async def get_person_detection_over_time(req: func.HttpRequest) -> func.HttpResp
         capacity = setup_items[0].get("capacityOfPeople", 0)
         if capacity == 0:
             return func.HttpResponse(
-                json.dumps({"error": "Capacity not set or is zero"}),
+                json.dumps({"warn": "Capacity not set or is zero"}),
                 status_code=400
             )
  
-        # Query to get person logs from user_logs table
+        # Query to get person logs from user_logs table using organization_id
         logs_query = """
         SELECT c.logs
         FROM c
-        WHERE c.user_id = @user_id
+        WHERE c.user_id= @organization_id
         """
        
         logs_items = list(user_logs_container.query_items(
@@ -1796,16 +1895,19 @@ async def get_person_detection_over_time(req: func.HttpRequest) -> func.HttpResp
             event_type = log.get("event_type")
  
             if timestamp and camera_id and event_type:
-                # Convert timestamp to pendulum and truncate to hour
-                dt = pendulum.parse(timestamp)
-                # Reset minutes and seconds to get exact hour
-                dt = dt.start_of('hour')
-                hour_key = dt.format('YYYY-MM-DD HH')
-               
-                if event_type == "person_entry":
-                    entry_counts_by_hour[hour_key][camera_id] += 1
-                elif event_type == "person_exit":
-                    exit_counts_by_hour[hour_key][camera_id] += 1
+                try:
+                    # Convert timestamp to pendulum and truncate to hour
+                    dt = pendulum.parse(timestamp)
+                    dt = dt.start_of('hour')
+                    hour_key = dt.format('YYYY-MM-DD HH')
+                   
+                    if event_type == "person_entry":
+                        entry_counts_by_hour[hour_key][camera_id] += 1
+                    elif event_type == "person_exit":
+                        exit_counts_by_hour[hour_key][camera_id] += 1
+                except Exception as parse_error:
+                    logging.warning(f"Failed to parse timestamp {timestamp}: {str(parse_error)}")
+                    continue
  
         # Get a set of all hour keys from both entries and exits
         all_hour_keys = set(entry_counts_by_hour.keys()) | set(exit_counts_by_hour.keys())
@@ -1835,18 +1937,22 @@ async def get_person_detection_over_time(req: func.HttpRequest) -> func.HttpResp
             percentage = (total_count / capacity * 100) if capacity > 0 else 0
            
             # Parse the hour key and create hour range
-            dt = pendulum.from_format(hour_key, 'YYYY-MM-DD HH')
-            next_hour = dt.add(hours=1)
-           
-            hour_range = f"{dt.format('h:mm A')} - {next_hour.format('h:mm A')}"
-           
-            time_series_data.append({
-                "date": dt.format('YYYY-MM-DD'),
-                "hour_range": hour_range,
-                "total_person_count": total_count,
-                "camera_counts": camera_counts,
-                "percentage": round(percentage, 2)
-            })
+            try:
+                dt = pendulum.from_format(hour_key, 'YYYY-MM-DD HH')
+                next_hour = dt.add(hours=1)
+               
+                hour_range = f"{dt.format('h:mm A')} - {next_hour.format('h:mm A')}"
+               
+                time_series_data.append({
+                    "date": dt.format('YYYY-MM-DD'),
+                    "hour_range": hour_range,
+                    "total_person_count": total_count,
+                    "camera_counts": camera_counts,
+                    "percentage": round(percentage, 2)
+                })
+            except Exception as format_error:
+                logging.error(f"Failed to format hour_key {hour_key}: {str(format_error)}")
+                continue
  
         # Sort data by datetime
         time_series_data.sort(key=lambda x: pendulum.from_format(
@@ -1865,9 +1971,10 @@ async def get_person_detection_over_time(req: func.HttpRequest) -> func.HttpResp
     except Exception as e:
         logging.error(f"Unexpected error: {str(e)}")
         return func.HttpResponse(
-            json.dumps({"detail": "An unexpected error occurred."}),
+            json.dumps({"warn": "An unexpected error occurred."}),
             status_code=500
         )
+ 
 
 @app.function_name(name="getAllCounts")
 @app.route(route='api/getAllCounts', methods=[func.HttpMethod.GET])
@@ -1876,14 +1983,34 @@ async def getAllCounts(req: func.HttpRequest) -> func.HttpResponse:
     user_info = req.user_info
     user_id = user_info['sub']
    
+    # Initialize containers
+    users_container = database.get_container_client(USERS)
+   
     try:
-        # Query to get capacity from setup container
+        # First check users container for organization_id
+        user_query = "SELECT c.organization_id FROM c WHERE c.azure_b2c_id = @user_id"
+        user_params = [{"name": "@user_id", "value": user_id}]
+       
+        user_items = list(users_container.query_items(
+            query=user_query,
+            parameters=user_params,
+            enable_cross_partition_query=True
+        ))
+       
+        # Determine organization_id to use
+        if user_items and len(user_items) > 0 and 'organization_id' in user_items[0]:
+            organization_id = user_items[0]['organization_id']
+        else:
+            # Fallback to using sub directly as organization_id
+            organization_id = user_id
+ 
+        # Query to get capacity from setup container using organization_id
         capacity_query = """
         SELECT c.capacityOfPeople
         FROM c
-        WHERE c.user_id = @user_id
+        WHERE c.organization_id = @organization_id
         """
-        parameters = [{"name": "@user_id", "value": user_id}]
+        parameters = [{"name": "@organization_id", "value": organization_id}]
        
         setup_items = list(setup_container.query_items(
             query=capacity_query,
@@ -1893,11 +2020,11 @@ async def getAllCounts(req: func.HttpRequest) -> func.HttpResponse:
        
         capacity = setup_items[0].get("capacityOfPeople", 0) if setup_items else 0
        
-        # Query to get counts from user_counts table
+        # Query to get counts from user_counts table using organization_id
         counts_query = """
         SELECT c.cameras, c.last_updated
         FROM c
-        WHERE c.user_id = @user_id
+        WHERE c.user_id = @organization_id
         """
        
         count_items = list(user_counts_container.query_items(
@@ -1959,10 +2086,9 @@ async def getAllCounts(req: func.HttpRequest) -> func.HttpResponse:
     except Exception as e:
         logging.error(f"Unexpected error: {str(e)}")
         return func.HttpResponse(
-            json.dumps({"detail": "An unexpected error occurred."}),
+            json.dumps({"warn": "An unexpected error occurred."}),
             status_code=500
-        )
- 
+        )  
 
 
 
@@ -2002,7 +2128,7 @@ async def authenticated_edit_data(req: func.HttpRequest) -> func.HttpResponse:
  
         if not existing_items:
             return func.HttpResponse(
-                json.dumps({"detail": "No data found for this organization."}),
+                json.dumps({"warn": "No data found for this organization."}),
                 status_code=404
             )
  
@@ -2037,7 +2163,7 @@ async def authenticated_edit_data(req: func.HttpRequest) -> func.HttpResponse:
     except Exception as e:
         logging.error(f"Error processing request: {str(e)}")
         return func.HttpResponse(
-            json.dumps({"detail": f"An error occurred during processing: {str(e)}"}),
+            json.dumps({"warn": f"An error occurred during processing: {str(e)}"}),
             status_code=500
         )
  
@@ -2062,7 +2188,7 @@ async def authenticated_delete_data(req: func.HttpRequest) -> func.HttpResponse:
  
         if not existing_items:
             return func.HttpResponse(
-                json.dumps({"detail": "No data found for this organization."}),
+                json.dumps({"warn": "No data found for this organization."}),
                 status_code=404
             )
  
@@ -2084,51 +2210,11 @@ async def authenticated_delete_data(req: func.HttpRequest) -> func.HttpResponse:
     except Exception as e:
         logging.error(f"Error processing request: {str(e)}")
         return func.HttpResponse(
-            json.dumps({"detail": f"An error occurred during processing: {str(e)}"}),
+            json.dumps({"warn": f"An error occurred during processing: {str(e)}"}),
             status_code=500
         )
     
 
-
-@app.function_name(name="checkUserExists")
-@app.route(route='api/checkUserExists', methods=[func.HttpMethod.GET])
-@require_auth
-async def check_user_exists(req: func.HttpRequest) -> func.HttpResponse:
-    user_info = req.user_info
-    organization_id = user_info['sub']
-   
-    try:
-        # Query the setup-details container to check if the organization ID exists
-        query = "SELECT VALUE COUNT(1) FROM c WHERE c.organization_id = @organization_id"
-        parameters = [{"name": "@organization_id", "value": organization_id}]
-       
-        items = list(setup_container.query_items(
-            query=query,
-            parameters=parameters,
-            enable_cross_partition_query=True
-        ))
-       
-        # items[0] will contain the count (0 if not found, ≥1 if found)
-        user_exists = items[0] > 0
-       
-        return func.HttpResponse(
-            json.dumps({
-                "data": {
-                    "exists": user_exists,
-                    "message": "User exists" if user_exists else "User does not exist"
-                }
-            }),
-            mimetype="application/json",
-            status_code=200
-        )
-    except Exception as e:
-        logging.error(f"Error checking if user exists: {str(e)}")
-        return func.HttpResponse(
-            json.dumps({"detail": "An error occurred while checking if the user exists."}),
-            mimetype="application/json",
-            status_code=500
-        )
- 
 
 @app.function_name(name="get_organization_camera_data")
 @app.route(route='api/organization/camera-data', methods=[func.HttpMethod.GET])
@@ -2140,7 +2226,7 @@ async def get_organization_camera_data(req: func.HttpRequest) -> func.HttpRespon
 
         if not organization_id:
             return func.HttpResponse(
-                json.dumps({"error": "Invalid token: organizationId (sub) missing"}),
+                json.dumps({"warn": "Invalid token: organizationId (sub) missing"}),
                 status_code=401,
                 mimetype="application/json"
             )
@@ -2182,7 +2268,7 @@ async def get_organization_camera_data(req: func.HttpRequest) -> func.HttpRespon
     except Exception as e:
         logging.error(f"Error fetching organization and camera data for {organization_id}: {str(e)}")
         return func.HttpResponse(
-            json.dumps({"error": "Internal server error"}),
+            json.dumps({"warn": "Internal server error"}),
             status_code=500,
             mimetype="application/json"
         )
@@ -2193,6 +2279,9 @@ async def get_organization_camera_data(req: func.HttpRequest) -> func.HttpRespon
 async def get_person_count_by_date(req: func.HttpRequest) -> func.HttpResponse:
     user_info = req.user_info
     user_id = user_info['sub']
+   
+    # Initialize containers
+    users_container = database.get_container_client(USERS)
    
     # Get the date parameter from the request query string
     # If not provided, use current date
@@ -2206,18 +2295,35 @@ async def get_person_count_by_date(req: func.HttpRequest) -> func.HttpResponse:
             selected_date = pendulum.parse(date_param).format('YYYY-MM-DD')
         except Exception as e:
             return func.HttpResponse(
-                json.dumps({"error": f"Invalid date format. Please use YYYY-MM-DD. Details: {str(e)}"}),
+                json.dumps({"warn": f"Invalid date format. Please use YYYY-MM-DD. Details: {str(e)}"}),
                 status_code=400
             )
    
     try:
-        # Query to get person logs from user_logs table
+        # First check users container for organization_id
+        user_query = "SELECT c.organization_id FROM c WHERE c.azure_b2c_id = @user_id"
+        user_params = [{"name": "@user_id", "value": user_id}]
+       
+        user_items = list(users_container.query_items(
+            query=user_query,
+            parameters=user_params,
+            enable_cross_partition_query=True
+        ))
+       
+        # Determine organization_id to use
+        if user_items and len(user_items) > 0 and 'organization_id' in user_items[0]:
+            organization_id = user_items[0]['organization_id']
+        else:
+            # Fallback to using sub directly as organization_id
+            organization_id = user_id
+ 
+        # Query to get person logs from user_logs table using organization_id
         logs_query = """
         SELECT c.logs
         FROM c
-        WHERE c.user_id = @user_id
+        WHERE c.user_id = @organization_id
         """
-        parameters = [{"name": "@user_id", "value": user_id}]
+        parameters = [{"name": "@organization_id", "value": organization_id}]
        
         logs_items = list(user_logs_container.query_items(
             query=logs_query,
@@ -2254,16 +2360,20 @@ async def get_person_count_by_date(req: func.HttpRequest) -> func.HttpResponse:
             event_type = log.get("event_type")
  
             if timestamp and camera_id and event_type:
-                # Parse timestamp and check if it's on the selected date
-                log_date = pendulum.parse(timestamp).format('YYYY-MM-DD')
-               
-                if log_date == selected_date:
-                    all_cameras.add(camera_id)
+                try:
+                    # Parse timestamp and check if it's on the selected date
+                    log_date = pendulum.parse(timestamp).format('YYYY-MM-DD')
                    
-                    if event_type == "person_entry":
-                        camera_entry_counts[camera_id] += 1
-                    elif event_type == "person_exit":
-                        camera_exit_counts[camera_id] += 1
+                    if log_date == selected_date:
+                        all_cameras.add(camera_id)
+                       
+                        if event_type == "person_entry":
+                            camera_entry_counts[camera_id] += 1
+                        elif event_type == "person_exit":
+                            camera_exit_counts[camera_id] += 1
+                except Exception as parse_error:
+                    logging.warning(f"Failed to parse timestamp {timestamp}: {str(parse_error)}")
+                    continue
        
         # Calculate totals
         total_entries = sum(camera_entry_counts.values())
@@ -2305,10 +2415,10 @@ async def get_person_count_by_date(req: func.HttpRequest) -> func.HttpResponse:
     except Exception as e:
         logging.error(f"Unexpected error in getPersonCountByDate: {str(e)}")
         return func.HttpResponse(
-            json.dumps({"detail": f"An unexpected error occurred: {str(e)}"}),
+            json.dumps({"warn": f"An unexpected error occurred: {str(e)}"}),
             status_code=500,
             mimetype="application/json"
-        )
+        )    
     
 
 @app.route(route="update_organization_camera_data", methods=["PUT"])
@@ -2324,7 +2434,7 @@ async def update_organization_camera_data(req: func.HttpRequest) -> func.HttpRes
         # Validate mandatory fields
         mandatory_org_fields = [
             "organizationId", "organizationName", "phoneNumber",
-            "websiteUrl", "domainName", "address"
+            "websiteUrl","address"
         ]
         mandatory_cam_fields = ["organizationId", "email", "cameraDetails"]
 
@@ -2352,9 +2462,9 @@ async def update_organization_camera_data(req: func.HttpRequest) -> func.HttpRes
         return func.HttpResponse("Organization and camera data updated successfully", status_code=200)
 
     except exceptions.CosmosHttpResponseError as e:
-        return func.HttpResponse(f"Cosmos DB Error: {str(e)}", status_code=500)
+        return func.HttpResponse(f"warn: Cosmos DB Error: {str(e)}", status_code=500)
     except Exception as e:
-        return func.HttpResponse(f"Error: {str(e)}", status_code=500)
+        return func.HttpResponse(f"warn: {str(e)}", status_code=500)
 
 
 
@@ -2708,45 +2818,60 @@ async def get_user_attendance(req: func.HttpRequest) -> func.HttpResponse:
 
 
 @app.function_name(name="editUser")
-@app.route(route='api/editUser', methods=[func.HttpMethod.PUT])  # Removed {user_id} from route
+@app.route(route='api/editUser', methods=[func.HttpMethod.PUT])
 @require_auth
 async def edit_user(req: func.HttpRequest) -> func.HttpResponse:
     user_info = req.user_info
     organization_id = user_info['sub']
-    
+   
     logging.info(f"Attempting to edit user for organization {organization_id}")
-    
+   
     try:
         # Get request body
         req_body = req.get_json()
-        
-        # Get user_id from body instead of params
+       
+        # Get user_id from body
         user_id = req_body.get('user_id')
-        
+       
         # Validate that user_id is provided
         if not user_id:
             return func.HttpResponse(
-                json.dumps({"detail": "User ID is required."}),
+                json.dumps({"warn": "User ID is required."}),
                 mimetype="application/json",
                 status_code=400
             )
-        
-        # Validate that role is provided
-        if 'role' not in req_body:
+       
+        # Validate that at least one field to update is provided
+        if 'role' not in req_body and 'name' not in req_body:
             return func.HttpResponse(
-                json.dumps({"detail": "Role is required."}),
+                json.dumps({"warn": "At least one of 'role' or 'name' is required."}),
                 mimetype="application/json",
                 status_code=400
             )
-        
-        # Validate role is either 'admin' or 'user'
-        if req_body['role'] not in ['Admin', 'User']:
+       
+        # Validate role if provided
+        if 'role' in req_body and req_body['role'] not in ['Admin', 'User']:
             return func.HttpResponse(
-                json.dumps({"detail": "Role must be either 'Admin' or 'User'."}),
+                json.dumps({"warn": "Role must be either 'Admin' or 'User'."}),
                 mimetype="application/json",
                 status_code=400
             )
-        
+       
+        # Validate name if provided
+        if 'name' in req_body:
+            if not isinstance(req_body['name'], str) or len(req_body['name'].strip()) == 0:
+                return func.HttpResponse(
+                    json.dumps({"warn": "Name must be a non-empty string."}),
+                    mimetype="application/json",
+                    status_code=400
+                )
+            if len(req_body['name'].strip()) > 256:  # Azure AD B2C displayName limit
+                return func.HttpResponse(
+                    json.dumps({"warn": "Name must be 256 characters or less."}),
+                    mimetype="application/json",
+                    status_code=400
+                )
+       
         # Retrieve existing user from database
         try:
             user_document = users_container.read_item(
@@ -2756,26 +2881,26 @@ async def edit_user(req: func.HttpRequest) -> func.HttpResponse:
         except Exception as e:
             logging.error(f"Error reading user from database: {str(e)}")
             return func.HttpResponse(
-                json.dumps({"detail": "User not found.", "error": str(e)}),
+                json.dumps({"warn": "User not found.", "error": str(e)}),
                 mimetype="application/json",
                 status_code=404
             )
-        
+       
         # Verify the user belongs to the same organization
         if user_document['organization_id'] != organization_id:
             logging.warning(f"Organization mismatch: document {user_document['organization_id']} vs auth {organization_id}")
             return func.HttpResponse(
-                json.dumps({"detail": "Unauthorized to modify this user."}),
+                json.dumps({"warn": "Unauthorized to modify this user."}),
                 mimetype="application/json",
                 status_code=403
             )
-        
+       
         # Azure AD B2C Configuration
         client_id = os.getenv("AZURE_B2C_CLIENT_ID")
         client_secret = os.getenv("AZURE_B2C_CLIENT_SECRET")
         tenant_name = os.getenv("AZURE_B2C_TENANT_NAME")
         tenant_domain = os.getenv("AZURE_B2C_DOMAIN", f"{tenant_name}.onmicrosoft.com")
-        
+       
         # Get Microsoft Graph token
         token_url = f"https://login.microsoftonline.com/{tenant_name}.onmicrosoft.com/oauth2/v2.0/token"
         token_data = {
@@ -2784,89 +2909,109 @@ async def edit_user(req: func.HttpRequest) -> func.HttpResponse:
             'scope': 'https://graph.microsoft.com/.default',
             'grant_type': 'client_credentials'
         }
-        
+       
         token_response = requests.post(token_url, data=token_data, headers={'Content-Type': 'application/x-www-form-urlencoded'})
-        
+       
         if token_response.status_code != 200:
             logging.error(f"Token request failed: {token_response.text}")
             return func.HttpResponse(
-                json.dumps({"detail": "Failed to authenticate with Azure AD"}),
+                json.dumps({"warn": "Failed to authenticate with Azure AD"}),
                 mimetype="application/json",
                 status_code=500
             )
-            
+           
         token_result = token_response.json()
         access_token = token_result.get('access_token')
-        
+       
         if not access_token:
             return func.HttpResponse(
-                json.dumps({"detail": "Failed to obtain access token"}),
+                json.dumps({"warn": "Failed to obtain access token"}),
                 mimetype="application/json",
                 status_code=500
             )
-        
+       
         # Update user in Azure AD B2C
         graph_url = f"https://graph.microsoft.com/v1.0/users/{user_document['azure_b2c_id']}"
         headers = {
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json"
         }
-        
-        # Get extension app ID
+       
+        # Get extension app ID for role (if updating role)
         extension_app_id = None
-        apps_url = "https://graph.microsoft.com/v1.0/applications"
-        apps_response = requests.get(apps_url, headers=headers, params={'$filter': 'displayName eq \'b2c-extensions-app\''})
-        
-        if apps_response.status_code == 200:
-            apps_data = apps_response.json()
-            if apps_data.get('value') and len(apps_data['value']) > 0:
-                extension_app_id = apps_data['value'][0]['appId'].replace('-', '')
-        
+        if 'role' in req_body:
+            apps_url = "https://graph.microsoft.com/v1.0/applications"
+            apps_response = requests.get(apps_url, headers=headers, params={'$filter': 'displayName eq \'b2c-extensions-app\''})
+           
+            if apps_response.status_code == 200:
+                apps_data = apps_response.json()
+                if apps_data.get('value') and len(apps_data['value']) > 0:
+                    extension_app_id = apps_data['value'][0]['appId'].replace('-', '')
+       
         # Prepare update payload
-        update_payload = {
-            "jobTitle": req_body['role']
-        }
-        
-        if extension_app_id:
-            update_payload[f"extension_{extension_app_id}_Role"] = req_body['role']
-        
+        update_payload = {}
+       
+        if 'role' in req_body:
+            update_payload["jobTitle"] = req_body['role']
+            if extension_app_id:
+                update_payload[f"extension_{extension_app_id}_Role"] = req_body['role']
+       
+        if 'name' in req_body:
+            update_payload["displayName"] = req_body['name'].strip()
+            # Split name for givenName and surname
+            name_parts = req_body['name'].strip().split()
+            update_payload["givenName"] = name_parts[0] if name_parts else req_body['name'].strip()
+            # Only include surname if there are multiple parts and the last part is non-empty
+            if len(name_parts) > 1 and name_parts[-1]:
+                update_payload["surname"] = name_parts[-1][:64]  # Ensure surname is within 64 chars
+       
         # Update in Azure AD B2C
-        b2c_response = requests.patch(graph_url, headers=headers, json=update_payload)
-        
-        if b2c_response.status_code >= 400:
-            logging.error(f"Error updating B2C user: {b2c_response.text}")
-            return func.HttpResponse(
-                json.dumps({"detail": "Failed to update user role in Azure AD B2C"}),
-                mimetype="application/json",
-                status_code=500
-            )
-        
+        if update_payload:
+            b2c_response = requests.patch(graph_url, headers=headers, json=update_payload)
+           
+            if b2c_response.status_code >= 400:
+                logging.error(f"Error updating B2C user: {b2c_response.text}")
+                return func.HttpResponse(
+                    json.dumps({"warn": "Failed to update user in Azure AD B2C", "error": b2c_response.text}),
+                    mimetype="application/json",
+                    status_code=500
+                )
+       
         # Update in database
-        user_document['role'] = req_body['role']
+        if 'role' in req_body:
+            user_document['role'] = req_body['role']
+        if 'name' in req_body:
+            user_document['name'] = req_body['name'].strip()
+       
         users_container.replace_item(
             item=user_document['id'],
             body=user_document
         )
-        
+       
+        # Prepare response
+        response_data = {
+            "user_id": user_id,
+            "message": "User updated successfully"
+        }
+        if 'role' in req_body:
+            response_data["role"] = req_body['role']
+        if 'name' in req_body:
+            response_data["name"] = req_body['name'].strip()
+       
         return func.HttpResponse(
-            json.dumps({
-                "data": {
-                    "user_id": user_id,
-                    "role": req_body['role'],
-                    "message": "User role updated successfully"
-                }
-            }),
+            json.dumps({"data": response_data}),
             mimetype="application/json",
             status_code=200
         )
-        
+       
     except Exception as e:
         logging.error(f"Error updating user: {str(e)}")
         return func.HttpResponse(
-            json.dumps({"detail": f"An error occurred while updating the user: {str(e)}"}),
+            json.dumps({"warn": f"An error occurred while updating the user: {str(e)}"}),
             mimetype="application/json",
             status_code=500
         )
+   
 
 @app.function_name(name="deleteUser")
 @app.route(route='api/deleteUser', methods=[func.HttpMethod.DELETE])
@@ -2880,7 +3025,7 @@ async def delete_user(req: func.HttpRequest) -> func.HttpResponse:
         # Validate user_id is provided in the request body
         if not req_body or 'user_id' not in req_body:
             return func.HttpResponse(
-                json.dumps({"detail": "User ID is required in the request body."}),
+                json.dumps({"warn": "User ID is required in the request body."}),
                 mimetype="application/json",
                 status_code=400
             )
@@ -2903,7 +3048,7 @@ async def delete_user(req: func.HttpRequest) -> func.HttpResponse:
 
         if not user_items:
             return func.HttpResponse(
-                json.dumps({"detail": "User not found or you don't have permission to delete this user."}),
+                json.dumps({"warn": "User not found or you don't have permission to delete this user."}),
                 mimetype="application/json",
                 status_code=404
             )
@@ -2936,7 +3081,7 @@ async def delete_user(req: func.HttpRequest) -> func.HttpResponse:
             if token_response.status_code != 200:
                 logging.error(f"Token request failed: {token_response.text}")
                 return func.HttpResponse(
-                    json.dumps({"detail": "Failed to authenticate for user deletion."}),
+                    json.dumps({"warn": "Failed to authenticate for user deletion."}),
                     mimetype="application/json",
                     status_code=500
                 )
@@ -2955,7 +3100,7 @@ async def delete_user(req: func.HttpRequest) -> func.HttpResponse:
             if b2c_delete_response.status_code >= 400:
                 logging.error(f"Failed to delete from Azure AD B2C: {b2c_delete_response.text}")
                 return func.HttpResponse(
-                    json.dumps({"detail": "Failed to delete user from Azure AD B2C."}),
+                    json.dumps({"warn": "Failed to delete user from Azure AD B2C."}),
                     mimetype="application/json",
                     status_code=500
                 )
@@ -2975,7 +3120,7 @@ async def delete_user(req: func.HttpRequest) -> func.HttpResponse:
     except Exception as e:
         logging.error(f"Error deleting user: {str(e)}")
         return func.HttpResponse(
-            json.dumps({"detail": "An error occurred during user deletion."}),
+            json.dumps({"warn": "An error occurred during user deletion."}),
             mimetype="application/json",
             status_code=500
         )
@@ -2989,79 +3134,66 @@ async def add_user(req: func.HttpRequest) -> func.HttpResponse:
     organization_id = user_info['sub']
    
     try:
-        # Get request body
         req_body = req.get_json()
        
-        # Validate required fields
         if not all(field in req_body for field in ['name', 'email', 'role']):
             return func.HttpResponse(
-                json.dumps({"detail": "Missing required fields. Name, email, and role are required."}),
+                json.dumps({"warn": "Missing required fields. Name, email, and role are required."}),
                 mimetype="application/json",
                 status_code=400
             )
        
-        # Validate role is either 'admin' or 'user'
         if req_body['role'] not in ['Admin', 'User']:
             return func.HttpResponse(
-                json.dumps({"detail": "Role must be either 'Admin' or 'User'."}),
+                json.dumps({"warn": "Role must be either 'Admin' or 'User'."}),
                 mimetype="application/json",
                 status_code=400
             )
        
-        # Generate a unique user ID
-        user_id = str(uuid.uuid4())
+        email = req_body['email']
+        query = f"SELECT * FROM c WHERE c.email = '{email}'"
+        existing_users = list(users_container.query_items(query=query, enable_cross_partition_query=True))
+        if existing_users:
+            return func.HttpResponse(
+                json.dumps({"warn": f"Email '{email}' already exists."}),
+                mimetype="application/json",
+                status_code=409
+            )
        
-        # Create the user document for your database
+        user_id = str(uuid.uuid4())
         user_document = {
             'id': user_id,
             'user_id': user_id,
             'organization_id': organization_id,
             'name': req_body['name'],
-            'email': req_body['email'],
+            'email': email,
             'role': req_body['role'],
             'created_at': pendulum.now().isoformat()
         }
        
-        # Insert the user document into the users container
-        users_container.create_item(body=user_document)
-       
-        # Azure AD B2C Configuration
-        client_id = os.getenv("AZURE_B2C_CLIENT_ID")
-        client_secret = os.getenv("AZURE_B2C_CLIENT_SECRET")
-        tenant_name = os.getenv("AZURE_B2C_TENANT_NAME")
-        tenant_domain = os.getenv("AZURE_B2C_DOMAIN", f"{tenant_name}.onmicrosoft.com")
-       
-        # Get mail nickname from email
-        mail_nickname = req_body['email'].split('@')[0]
-       
-        # Generate a secure random password that meets Azure AD B2C requirements
         def generate_secure_password():
             chars = string.ascii_lowercase + string.ascii_uppercase + string.digits
             special_chars = "!@#$%^&*()-_=+[]{}|;:,.<>?"
-           
             while True:
-                password = ''.join(random.choice(chars) for _ in range(10))
-                password += random.choice(special_chars)
-                password += random.choice(special_chars)
-               
+                password = ''.join(random.choice(chars) for _ in range(10)) + \
+                          random.choice(special_chars) + random.choice(special_chars)
                 password_list = list(password)
                 random.shuffle(password_list)
                 password = ''.join(password_list)
-               
-                email_parts = req_body['email'].lower().split('@')
-                username_part = email_parts[0]
-                domain_part = email_parts[1] if len(email_parts) > 1 else ""
-               
-                if (username_part not in password.lower() and
-                    domain_part not in password.lower()):
+                email_parts = email.lower().split('@')
+                if (email_parts[0] not in password.lower() and
+                    (len(email_parts) < 2 or email_parts[1] not in password.lower())):
                     return password
        
         password = generate_secure_password()
        
-        # Use the standard Azure AD endpoint for client credentials flow
-        token_url = f"https://login.microsoftonline.com/{tenant_name}.onmicrosoft.com/oauth2/v2.0/token"
+        client_id = os.getenv("AZURE_B2C_CLIENT_ID")
+        client_secret = os.getenv("AZURE_B2C_CLIENT_SECRET")
+        tenant_name = os.getenv("AZURE_B2C_TENANT_NAME")
+        tenant_domain = os.getenv("AZURE_B2C_DOMAIN", f"{tenant_name}.onmicrosoft.com")
+        mail_nickname = email.split('@')[0]
        
-        # Get Microsoft Graph token using client credentials flow
+        token_url = f"https://login.microsoftonline.com/{tenant_name}.onmicrosoft.com/oauth2/v2.0/token"
         token_data = {
             'client_id': client_id,
             'client_secret': client_secret,
@@ -3069,212 +3201,151 @@ async def add_user(req: func.HttpRequest) -> func.HttpResponse:
             'grant_type': 'client_credentials'
         }
        
-        logging.info(f"Requesting token from: {token_url}")
-       
-        token_response = requests.post(
-            token_url,
-            data=token_data,
-            headers={'Content-Type': 'application/x-www-form-urlencoded'}
-        )
-       
-        if token_response.status_code != 200:
-            logging.error(f"Token request failed with status {token_response.status_code}")
-            logging.error(f"Response body: {token_response.text}")
-            return func.HttpResponse(
-                json.dumps({"detail": f"Failed to authenticate with Azure AD: {token_response.text}"}),
-                mimetype="application/json",
-                status_code=500
-            )
-           
+        token_response = requests.post(token_url, data=token_data, headers={'Content-Type': 'application/x-www-form-urlencoded'})
         token_result = token_response.json()
+        if token_response.status_code != 200 or "access_token" not in token_result:
+            raise Exception(f"Failed to authenticate with Azure AD: {token_result.get('error', 'Unknown error')}")
        
-        if "access_token" not in token_result:
-            logging.error(f"Unable to get token: {token_result.get('error')}")
-            return func.HttpResponse(
-                json.dumps({"detail": "Failed to authenticate with Azure AD"}),
-                mimetype="application/json",
-                status_code=500
-            )
-       
-        # Create user in Azure AD B2C
         graph_url = "https://graph.microsoft.com/v1.0/users"
         headers = {
             "Authorization": f"Bearer {token_result['access_token']}",
             "Content-Type": "application/json"
         }
        
-        # Prepare the user payload for Azure AD B2C
         display_name = req_body['name']
-        email = req_body['email']
-       
-        # Use the verified tenant domain for userPrincipalName with a unique identifier
         unique_id = user_id.split('-')[0]
         user_principal_name = f"{mail_nickname}_{unique_id}@{tenant_domain}"
        
-        # Get the extension app ID for custom attributes
         extension_app_id = None
-        try:
-            apps_url = "https://graph.microsoft.com/v1.0/applications"
-            apps_response = requests.get(
-                apps_url,
-                headers=headers,
-                params={'$filter': 'displayName eq \'b2c-extensions-app\''}
-            )
-           
-            if apps_response.status_code == 200:
-                apps_data = apps_response.json()
-               
-                if apps_data.get('value') and len(apps_data['value']) > 0:
-                    app_id = apps_data['value'][0]['appId']
-                    extension_app_id = app_id.replace('-', '')
-                    logging.info(f"Found extension app ID: {extension_app_id}")
-           
-        except Exception as e:
-            logging.warning(f"Could not retrieve extension app ID: {str(e)}")
+        apps_url = "https://graph.microsoft.com/v1.0/applications"
+        apps_response = requests.get(apps_url, headers=headers, params={'$filter': 'displayName eq \'b2c-extensions-app\''})
+        if apps_response.status_code == 200:
+            apps_data = apps_response.json()
+            if apps_data.get('value') and len(apps_data['value']) > 0:
+                extension_app_id = apps_data['value'][0]['appId'].replace('-', '')
        
-        # Create user payload with identities included directly
         user_payload = {
             "accountEnabled": True,
             "displayName": display_name,
             "mailNickname": f"{mail_nickname}_{unique_id}",
             "userPrincipalName": user_principal_name,
-            "passwordProfile": {
-                "forceChangePasswordNextSignIn": False,
-                "password": password
-            },
+            "passwordProfile": {"forceChangePasswordNextSignIn": False, "password": password},
             "passwordPolicies": "DisablePasswordExpiration",
-            "mail": email,  # Set primary email attribute
+            "mail": email,
             "otherMails": [email],
-            # Include identities directly in initial creation
             "identities": [
-                {
-                    "signInType": "emailAddress",
-                    "issuer": tenant_domain,  # Use tenant_name instead of tenant_domain
-                    "issuerAssignedId": email
-                },
-                {
-                    "signInType": "userPrincipalName",
-                    "issuer": tenant_domain,
-                    "issuerAssignedId": user_principal_name
-                }
+                {"signInType": "emailAddress", "issuer": tenant_domain, "issuerAssignedId": email},
+                {"signInType": "userPrincipalName", "issuer": tenant_domain, "issuerAssignedId": user_principal_name}
             ],
             "jobTitle": req_body['role']
         }
-       
-        # Add role and email as custom attributes
         if extension_app_id:
             user_payload[f"extension_{extension_app_id}_Role"] = req_body['role']
             user_payload[f"extension_{extension_app_id}_Email"] = email
-            # Add a flag to indicate email is the sign-in identity
             user_payload[f"extension_{extension_app_id}_SignInWithEmail"] = "true"
        
-        # Create the user in Azure AD B2C
+        sendgrid_api_key = os.getenv("SENDGRID_API_KEY")
+        sendgrid_template_id = os.getenv("SENDGRID_TEMPLATE_ID_TRACKER")
+        sender_email = os.getenv("EMAIL_SENDER", os.getenv("FROM_EMAIL"))
+        if not all([sendgrid_api_key, sendgrid_template_id, sender_email]):
+            raise Exception("Missing SendGrid configuration")
+       
+        sg = SendGridAPIClient(sendgrid_api_key)
+        message = Mail(from_email=From(sender_email, "Yectra"), to_emails=To(email))
+        message.template_id = sendgrid_template_id
+        message.dynamic_template_data = {"name": req_body['name'], "email": email, "password": password}
+       
         try:
-            logging.info(f"Creating user in B2C with email {email} and UPN {user_principal_name}")
+            # Step 1: Create database entry
+            users_container.create_item(body=user_document)
+            logging.info(f"Created database entry for user_id: {user_id}")
+           
+            # Step 2: Create Azure AD B2C user
             b2c_response = requests.post(graph_url, headers=headers, json=user_payload)
-           
-            if b2c_response.status_code >= 400:
-                logging.error(f"Error creating B2C user: Status {b2c_response.status_code}")
-                logging.error(f"Response: {b2c_response.text}")
-               
             b2c_response.raise_for_status()
-           
-            # Get the Azure AD B2C user ID
             b2c_user = b2c_response.json()
             b2c_user_id = b2c_user.get('id')
+            logging.info(f"Created Azure B2C user: {b2c_user_id}")
            
-            # Verify that identities were properly set - if not, update them
+            # Step 3: Verify and update email identity
             user_get_url = f"https://graph.microsoft.com/v1.0/users/{b2c_user_id}"
             user_get_response = requests.get(user_get_url, headers=headers)
+            user_get_response.raise_for_status()
             current_user = user_get_response.json()
            
-            # Check if email identity existsa
-            email_identity_exists = False
-            if 'identities' in current_user:
-                for identity in current_user['identities']:
-                    if (identity.get('signInType') == 'emailAddress' and
-                        identity.get('issuerAssignedId') == email):
-                        email_identity_exists = True
-                        break
-           
-            # If email identity doesn't exist, add it
-            if not email_identity_exists:
-                logging.info(f"Email identity not found, adding it explicitly for user {b2c_user_id}")
-               
-                # Get current identities
-                current_identities = current_user.get('identities', [])
-               
-                # Add email identity
-                current_identities.append({
-                    "signInType": "emailAddress",
-                    "issuer": tenant_name,
-                    "issuerAssignedId": email
-                })
-               
-                # Update with combined identities
-                identity_payload = {
-                    "identities": current_identities
-                }
-               
-                identity_response = requests.patch(
-                    user_get_url,
-                    headers=headers,
-                    json=identity_payload
-                )
-               
-                if identity_response.status_code >= 400:
-                    logging.warning(f"Could not add email identity: {identity_response.status_code}")
-                    logging.warning(f"Response: {identity_response.text}")
-                else:
-                    logging.info(f"Successfully added email identity for user {b2c_user_id}")
-           
-            # Store all relevant sign-in info in your database
-            user_document['azure_b2c_id'] = b2c_user_id
-            users_container.replace_item(
-                item=user_document['id'],
-                body=user_document
+            email_identity_exists = any(
+                identity.get('signInType') == 'emailAddress' and identity.get('issuerAssignedId') == email
+                for identity in current_user.get('identities', [])
             )
            
-            # Return the user credentials in the response
+            if not email_identity_exists:
+                current_identities = current_user.get('identities', [])
+                current_identities.append({
+                    "signInType": "emailAddress",
+                    "issuer": tenant_domain,  # Ensure this matches your B2C tenant configuration
+                    "issuerAssignedId": email
+                })
+                identity_payload = {"identities": current_identities}
+                identity_response = requests.patch(user_get_url, headers=headers, json=identity_payload)
+                if identity_response.status_code >= 400:
+                    error_detail = identity_response.json().get('error', {}).get('message', 'Unknown error')
+                    logging.error(f"Failed to update identity: {identity_response.status_code} - {error_detail}")
+                    logging.error(f"Payload sent: {json.dumps(identity_payload, indent=2)}")
+                    identity_response.raise_for_status()
+                logging.info(f"Updated email identity for user: {b2c_user_id}")
+           
+            # Step 4: Send email
+            email_response = sg.send(message)
+            logging.info(f"Email sent to: {email}")
+           
+            # Update user document with Azure B2C ID
+            user_document['azure_b2c_id'] = b2c_user_id
+            users_container.replace_item(item=user_document['id'], body=user_document)
+           
             return func.HttpResponse(
                 json.dumps({
                     "data": {
                         "user_id": user_id,
                         "azure_b2c_id": b2c_user_id,
-                        "credentials": {
-                            "email": email,
-                            "password": password
-                        },
-                        "message": "User added successfully to database and Azure AD B2C"
+                        "credentials": {"email": email, "password": password},
+                        "message": "User added successfully to database and Azure AD B2C, email sent successfully"
                     }
                 }),
                 mimetype="application/json",
                 status_code=201
             )
-        except requests.exceptions.HTTPError as http_err:
-            error_message = http_err.response.json() if http_err.response.content else str(http_err)
-            logging.error(f"Error creating user in Azure AD B2C: {error_message}")
            
-            # User was created in your database but not in B2C
-            return func.HttpResponse(
-                json.dumps({
-                    "data": {
-                        "user_id": user_id,
-                        "message": "User added to database but failed to register in Azure AD B2C",
-                        "azure_error": error_message
-                    }
-                }),
-                mimetype="application/json",
-                status_code=500
-            )
+        except Exception as e:
+            # Enhanced rollback with retry for database
+            for attempt in range(3):
+                try:
+                    users_container.delete_item(item=user_id, partition_key=organization_id)
+                    logging.info(f"Rolled back database entry for user_id: {user_id}")
+                    break
+                except Exception as db_err:
+                    logging.warning(f"Attempt {attempt + 1} failed to rollback database entry: {str(db_err)}")
+                    if attempt == 2:
+                        logging.error(f"Failed to rollback database entry after 3 attempts: {str(db_err)}")
+                pendulum.time.sleep(1)  # Wait between retries
+           
+            if 'b2c_user_id' in locals():
+                try:
+                    requests.delete(f"https://graph.microsoft.com/v1.0/users/{b2c_user_id}", headers=headers)
+                    logging.info(f"Rolled back Azure B2C user: {b2c_user_id}")
+                except Exception as b2c_err:
+                    logging.warning(f"Failed to rollback Azure B2C user: {b2c_user_id} - {str(b2c_err)}")
+           
+            raise e
+           
     except Exception as e:
-        logging.error(f"Error adding user: {str(e)}")
+        error_message = str(e)
+        logging.error(f"Error adding user: {error_message}")
         return func.HttpResponse(
-            json.dumps({"detail": f"An error occurred while adding the user: {str(e)}"}),
+            json.dumps({"warn": f"Failed to add user: {error_message}"}),
             mimetype="application/json",
             status_code=500
         )
-    
+   
 
 @app.function_name(name="getAllUsers")
 @app.route(route='api/getAllUsers', methods=[func.HttpMethod.GET])
@@ -3363,7 +3434,7 @@ async def get_all_users(req: func.HttpRequest) -> func.HttpResponse:
         except exceptions as e:
             logging.error(f"Cosmos DB Error: {str(e)}")
             return func.HttpResponse(
-                json.dumps({"detail": f"Database error: {str(e)}"}),
+                json.dumps({"warn": f"Database error: {str(e)}"}),
                 mimetype="application/json",
                 status_code=500
             )
@@ -3396,7 +3467,7 @@ async def get_all_users(req: func.HttpRequest) -> func.HttpResponse:
     except Exception as e:
         logging.error(f"Error getting users: {str(e)}")
         return func.HttpResponse(
-            json.dumps({"detail": f"An error occurred while getting users: {str(e)}"}),
+            json.dumps({"warn": f"An error occurred while getting users: {str(e)}"}),
             mimetype="application/json",
             status_code=500
         )
@@ -3596,7 +3667,7 @@ async def add_employee(req: func.HttpRequest) -> func.HttpResponse:
         organization_id = req.user_info.get('user_id')
         if not organization_id:
             return func.HttpResponse(
-                body=json.dumps({'error': 'Invalid token: organizationId (sub) missing'}),
+                body=json.dumps({'warn': 'Invalid token: organizationId (sub) missing'}),
                 status_code=401,
                 mimetype="application/json"
             )
@@ -3606,7 +3677,7 @@ async def add_employee(req: func.HttpRequest) -> func.HttpResponse:
 
         if not json_data:
             return func.HttpResponse(
-                body=json.dumps({'error': 'JSON data is required in the request body'}),
+                body=json.dumps({'warn': 'JSON data is required in the request body'}),
                 status_code=400,
                 mimetype="application/json"
             )
@@ -3621,7 +3692,7 @@ async def add_employee(req: func.HttpRequest) -> func.HttpResponse:
         # Check if required fields are provided
         if not employee_id or not name or not role or not email:
             return func.HttpResponse(
-                body=json.dumps({'error': 'All fields except image are required'}),
+                body=json.dumps({'warn': 'All fields except image are required'}),
                 status_code=400,
                 mimetype="application/json"
             )
@@ -3630,7 +3701,7 @@ async def add_employee(req: func.HttpRequest) -> func.HttpResponse:
         EMAIL_REGEX = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
         if not re.match(EMAIL_REGEX, email):
             return func.HttpResponse(
-                body=json.dumps({'error': 'Invalid email format'}),
+                body=json.dumps({'warn': 'Invalid email format'}),
                 status_code=400,
                 mimetype="application/json"
             )
@@ -3638,17 +3709,18 @@ async def add_employee(req: func.HttpRequest) -> func.HttpResponse:
         # Validate role format
         if role not in ['Admin', 'User', 'Employee']:
             return func.HttpResponse(
-                body=json.dumps({'error': 'Role must be either Admin, User, or Employee'}),
+                body=json.dumps({'warn': 'Role must be either Admin, User, or Employee'}),
                 status_code=400,
                 mimetype="application/json"
             )
-         # Check if email already exists in Cosmos DB
+            
+        # Check if email already exists in Cosmos DB
         email_query = f"SELECT * FROM c WHERE c.email = '{email}'"
         existing_email = list(employee_container.query_items(query=email_query, enable_cross_partition_query=True))
 
         if existing_email:
             return func.HttpResponse(
-                body=json.dumps({'error': f'Email {email} is already in use'}),
+                body=json.dumps({'warn': f'Email {email} is already in use'}),
                 status_code=409,  # Conflict
                 mimetype="application/json"
             )
@@ -3657,7 +3729,7 @@ async def add_employee(req: func.HttpRequest) -> func.HttpResponse:
         if image_name:
             if not image_name.lower().endswith(ALLOWED_IMAGE_FORMATS):
                 return func.HttpResponse(
-                    body=json.dumps({'error': f'Invalid image format. Allowed formats: {ALLOWED_IMAGE_FORMATS}'}),
+                    body=json.dumps({'warn': f'Invalid image format. Allowed formats: {ALLOWED_IMAGE_FORMATS}'}),
                     status_code=400,
                     mimetype="application/json"
                 )
@@ -3668,7 +3740,7 @@ async def add_employee(req: func.HttpRequest) -> func.HttpResponse:
 
         if existing_employees:
             return func.HttpResponse(
-                body=json.dumps({'Warn': f'Employee with employeeId {employee_id} already exists'}),
+                body=json.dumps({'warn': f'Employee with employeeId {employee_id} already exists'}),
                 status_code=409,  # Conflict status code
                 mimetype="application/json"
             )
@@ -3737,7 +3809,7 @@ async def add_employee(req: func.HttpRequest) -> func.HttpResponse:
             logging.error(f"Response body: {token_response.text}")
             return func.HttpResponse(
                 body=json.dumps({
-                    'error': f"Failed to authenticate with Azure AD: {token_response.text}",
+                    'warn': f"Failed to authenticate with Azure AD: {token_response.text}",
                 }),
                 status_code=500,
                 mimetype="application/json"
@@ -3749,19 +3821,37 @@ async def add_employee(req: func.HttpRequest) -> func.HttpResponse:
             logging.error(f"Unable to get token: {token_result.get('error')}")
             return func.HttpResponse(
                 body=json.dumps({
-                    'error': 'Failed to authenticate with Azure AD',
+                    'warn': 'Failed to authenticate with Azure AD',
                 }),
                 status_code=500,
                 mimetype="application/json"
             )
         
+        # Check if email already exists in Azure AD B2C
+        check_user_url = f"https://graph.microsoft.com/v1.0/users?$filter=identities/any(id:id/issuerAssignedId eq '{email}' and id/issuer eq '{tenant_domain}')"
+        check_user_response = requests.get(check_user_url, headers={
+            "Authorization": f"Bearer {token_result['access_token']}",
+            "Content-Type": "application/json"
+        })
+
+        if check_user_response.status_code == 200:
+            user_data = check_user_response.json()
+            if user_data.get("value"):
+                return func.HttpResponse(
+                    body=json.dumps({'error': f'Email {email} already exists in Azure AD B2C'}),
+                    status_code=409,
+                    mimetype="application/json"
+                )
+        else:
+            logging.warning(f"Failed to check existing B2C user: {check_user_response.text}")
+
         # Create user in Azure AD B2C
         graph_url = "https://graph.microsoft.com/v1.0/users"
         headers = {
             "Authorization": f"Bearer {token_result['access_token']}",
             "Content-Type": "application/json"
         }
-        
+       
         # Prepare the user payload for Azure AD B2C
         display_name = name
         
@@ -3830,128 +3920,166 @@ async def add_employee(req: func.HttpRequest) -> func.HttpResponse:
         try:
             logging.info(f"Creating user in B2C with email {email} and UPN {user_principal_name}")
             b2c_response = requests.post(graph_url, headers=headers, json=user_payload)
-            
-            if b2c_response.status_code >= 400:
-                logging.error(f"Error creating B2C user: Status {b2c_response.status_code}")
-                logging.error(f"Response: {b2c_response.text}")
-                
-                # Return error since we're doing Azure first approach
-                return func.HttpResponse(
-                    body=json.dumps({
-                        'error': f"Failed to create user in Azure AD B2C: {b2c_response.text}"
-                    }),
-                    status_code=500,
-                    mimetype="application/json"
-                )
-            
-            b2c_response.raise_for_status()
-            
-            # Get the Azure AD B2C user ID
-            b2c_user = b2c_response.json()
-            b2c_user_id = b2c_user.get('id')
-            
-            # Verify that identities were properly set - if not, update them
-            user_get_url = f"https://graph.microsoft.com/v1.0/users/{b2c_user_id}"
-            user_get_response = requests.get(user_get_url, headers=headers)
-            current_user = user_get_response.json()
-            
-            # Check if email identity exists
-            email_identity_exists = False
-            if 'identities' in current_user:
-                for identity in current_user['identities']:
-                    if (identity.get('signInType') == 'emailAddress' and
-                        identity.get('issuerAssignedId') == email):
-                        email_identity_exists = True
-                        break
-            
-            # If email identity doesn't exist, add it
-            if not email_identity_exists:
-                logging.info(f"Email identity not found, adding it explicitly for user {b2c_user_id}")
-                
-                # Get current identities
-                current_identities = current_user.get('identities', [])
-                
-                # Add email identity
-                current_identities.append({
-                    "signInType": "emailAddress",
-                    "issuer": tenant_name,
-                    "issuerAssignedId": email
-                })
-                
-                # Update with combined identities
-                identity_payload = {
-                    "identities": current_identities
-                }
-                
-                identity_response = requests.patch(
-                    user_get_url,
-                    headers=headers,
-                    json=identity_payload
-                )
-                
-                if identity_response.status_code >= 400:
-                    logging.warning(f"Could not add email identity: {identity_response.status_code}")
-                    logging.warning(f"Response: {identity_response.text}")
-                else:
-                    logging.info(f"Successfully added email identity for user {b2c_user_id}")
-            
-            # NOW THAT AZURE CREATION IS SUCCESSFUL, CREATE THE EMPLOYEE RECORD
-            # Create the employee record with the Azure B2C ID
-            employee_record = {
-                'id': b2c_user_id,
-                'employeeId': employee_id,
-                'employeeName': name,
-                'role': role,
-                'email': email,
-                'imageUrl': image_url,
-                'organizationId': organization_id,
-                'userId': organization_id,
-                'azure_b2c_id': b2c_user_id,
-                'created_at': pendulum.now().isoformat()
-            }
-
-            # Save the employee record in Cosmos DB
-            employee_container.create_item(body=employee_record)
-            
-            # Return the user credentials in the response
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Error creating user in B2C: {str(e)}")
             return func.HttpResponse(
-                body=json.dumps({
-                    'message': 'Employee added successfully to Azure AD B2C and database',
-                    'data': {
-                        'employee': employee_record,
-                        'azure_b2c_id': b2c_user_id,
-                        'credentials': {
-                            'email': email,
-                            'password': password
-                        }
-                    }
-                }),
-                status_code=201,
+                json.dumps({"warn": f"Failed to create user in Azure AD B2C: {str(e)}"}),
+                status_code=500,
                 mimetype="application/json"
             )
+        
+        if b2c_response.status_code >= 400:
+            logging.error(f"Error creating B2C user: Status {b2c_response.status_code}")
+            logging.error(f"Response: {b2c_response.text}")
             
-        except requests.exceptions.HTTPError as http_err:
-            error_message = http_err.response.json() if http_err.response.content else str(http_err)
-            logging.error(f"Error creating user in Azure AD B2C: {error_message}")
-            
-            # Return error since we're doing Azure first
+           
+            # Return error since we're doing Azure first approach
             return func.HttpResponse(
                 body=json.dumps({
-                    'error': f"Failed to create user in Azure AD B2C: {error_message}"
+                    'error': f"Failed to create user in Azure AD B2C: {b2c_response.text}"
                 }),
                 status_code=500,
                 mimetype="application/json"
             )
+        
+        b2c_response.raise_for_status()
+       
+        # Get the Azure AD B2C user ID
+        b2c_user = b2c_response.json()
+        b2c_user_id = b2c_user.get('id')
+       
+        # Verify that identities were properly set - if not, update them
+        user_get_url = f"https://graph.microsoft.com/v1.0/users/{b2c_user_id}"
+        user_get_response = requests.get(user_get_url, headers=headers)
+        current_user = user_get_response.json()
+       
+        # Check if email identity exists
+        email_identity_exists = False
+        if 'identities' in current_user:
+            for identity in current_user['identities']:
+                if (identity.get('signInType') == 'emailAddress' and
+                    identity.get('issuerAssignedId') == email):
+                    email_identity_exists = True
+                    break
+        
+        # If email identity doesn't exist, add it
+        if not email_identity_exists:
+            logging.info(f"Email identity not found, adding it explicitly for user {b2c_user_id}")
             
-    except Exception as e:
-        logging.error(f"Error adding employee: {str(e)}")
+            # Get current identities
+            current_identities = current_user.get('identities', [])
+            
+            # Add email identity
+            current_identities.append({
+                "signInType": "emailAddress",
+                "issuer": tenant_name,
+                "issuerAssignedId": email
+            })
+            
+            # Update with combined identities
+            identity_payload = {
+                "identities": current_identities
+            }
+            
+            identity_response = requests.patch(
+                user_get_url,
+                headers=headers,
+                json=identity_payload
+            )
+            
+            if identity_response.status_code >= 400:
+                logging.warning(f"Could not add email identity: {identity_response.status_code}")
+                logging.warning(f"Response: {identity_response.text}")
+            else:
+                logging.info(f"Successfully added email identity for user {b2c_user_id}")
+        
+        # NOW THAT AZURE CREATION IS SUCCESSFUL, CREATE THE EMPLOYEE RECORD
+        # Create the employee record with the Azure B2C ID
+        employee_record = {
+            'id': b2c_user_id,
+            'employeeId': employee_id,
+            'employeeName': name,
+            'role': role,
+            'email': email,
+            'imageUrl': image_url,
+            'organizationId': organization_id,
+            'userId': organization_id,
+            'azure_b2c_id': b2c_user_id,
+            'created_at': pendulum.now().isoformat()
+        }
+
+        # Save the employee record in Cosmos DB
+        employee_container.create_item(body=employee_record)
+
+        # Send credentials email
+        try:
+            # Get email configuration from environment variables
+            sendgrid_api_key = os.getenv("SENDGRID_API_KEY")
+            sender_email = os.getenv("EMAIL_SENDER", os.getenv("FROM_EMAIL"))
+            template_id = os.getenv("EMAIL_TEMPLATE_ID", os.getenv("SENDGRID_TEMPLATE_ID"))
+            
+            if not sendgrid_api_key or not sender_email or not template_id:
+                logging.error("Missing email configuration. Check environment variables.")
+                raise ValueError("Email configuration incomplete")
+            
+            logging.info(f"Sending credentials email to {email}")
+            
+            # Create and send email
+            message = Mail(
+                from_email=From(sender_email),
+                to_emails=To(email)
+            )
+            
+            # Prepare dynamic data for the template
+            message.dynamic_template_data = {
+                "name": name,
+                "employeeName": name,
+                "email": email,
+                "password": password,
+                "otp": password[:6]  # example: sending first 6 characters as OTP
+            }
+            
+            message.template_id = template_id
+            
+            sg = SendGridAPIClient(sendgrid_api_key)
+            response = sg.send(message)
+            
+            logging.info(f"Email sent to {email}. Status code: {response.status_code}")
+            
+        except Exception as email_error:
+            # Log error but don't fail the request
+            logging.error(f"Failed to send email to {email}: {str(email_error)}")
+            logging.error(f"SendGrid API Key (first 5 chars): {sendgrid_api_key[:5] if sendgrid_api_key else 'None'}...")
+            logging.error(f"Template ID: {template_id}")
+            logging.error(f"From Email: {sender_email}")
+
+        # Return the user credentials in the response
         return func.HttpResponse(
-            body=json.dumps({'error': str(e)}),
+            body=json.dumps({
+                'message': 'Employee added successfully to Azure AD B2C and database',
+                'data': {
+                    'employee': employee_record,
+                    'azure_b2c_id': b2c_user_id,
+                    'credentials': {
+                        'email': email,
+                        'password': password
+                    }
+                }
+            }),
+            status_code=201,
+            mimetype="application/json"
+        )
+        
+    except Exception as e:
+        logging.error(f"Error in add_employee function: {str(e)}")
+        import traceback
+        logging.error(f"Traceback: {traceback.format_exc()}")
+        return func.HttpResponse(
+            body=json.dumps({'warn': f'Failed to add employee: {str(e)}'}),
             status_code=500,
             mimetype="application/json"
         )
     
-
 
 @app.function_name(name="delete_employee")
 @app.route(route="employee/{employee_id}", methods=[func.HttpMethod.DELETE])
@@ -3963,7 +4091,7 @@ async def delete_employee(req: func.HttpRequest) -> func.HttpResponse:
     except Exception as e:
         logging.error(f"Unauthorized Request: {str(e)}")
         return func.HttpResponse(
-            json.dumps({"error": "Unauthorized: Missing or Invalid Token"}),
+            json.dumps({"warn": "Unauthorized: Missing or Invalid Token"}),
             status_code=401,
             mimetype="application/json"
         )
@@ -3987,7 +4115,7 @@ async def delete_employee(req: func.HttpRequest) -> func.HttpResponse:
             b2c_user_id = item.get('azure_b2c_id')
             if not b2c_user_id:
                 return func.HttpResponse(
-                    body=json.dumps({'error': 'Employee does not have an Azure B2C ID'}),
+                    body=json.dumps({'warn': 'Employee does not have an Azure B2C ID'}),
                     status_code=400,
                     mimetype="application/json"
                 )
@@ -4018,7 +4146,7 @@ async def delete_employee(req: func.HttpRequest) -> func.HttpResponse:
                 logging.error(f"Response body: {token_response.text}")
                 return func.HttpResponse(
                     body=json.dumps({
-                        'error': f"Failed to authenticate with Azure AD: {token_response.text}",
+                        'warn': f"Failed to authenticate with Azure AD: {token_response.text}",
                     }),
                     status_code=500,
                     mimetype="application/json"
@@ -4029,7 +4157,7 @@ async def delete_employee(req: func.HttpRequest) -> func.HttpResponse:
                 logging.error(f"Unable to get token: {token_result.get('error')}")
                 return func.HttpResponse(
                     body=json.dumps({
-                        'error': 'Failed to authenticate with Azure AD',
+                        'warn': 'Failed to authenticate with Azure AD',
                     }),
                     status_code=500,
                     mimetype="application/json"
@@ -4049,7 +4177,7 @@ async def delete_employee(req: func.HttpRequest) -> func.HttpResponse:
                 logging.error(f"Response: {delete_response.text}")
                 return func.HttpResponse(
                     body=json.dumps({
-                        'error': f"Failed to delete user from Azure AD B2C: {delete_response.text}"
+                        'warn': f"Failed to delete user from Azure AD B2C: {delete_response.text}"
                     }),
                     status_code=500,
                     mimetype="application/json"
@@ -4064,13 +4192,13 @@ async def delete_employee(req: func.HttpRequest) -> func.HttpResponse:
             logging.info(f"Employee {employee_id} deleted successfully from Cosmos DB.")
 
             return func.HttpResponse(
-                body=json.dumps({'message': 'Employee deleted successfully from Azure AD B2C and database'}),
+                body=json.dumps({'warn': 'Employee deleted successfully from Azure AD B2C and database'}),
                 status_code=200,
                 mimetype="application/json"
             )
 
         return func.HttpResponse(
-            body=json.dumps({'message': 'Employee not found'}),
+            body=json.dumps({'warn': 'Employee not found'}),
             status_code=404,
             mimetype="application/json"
         )
@@ -4078,7 +4206,7 @@ async def delete_employee(req: func.HttpRequest) -> func.HttpResponse:
     except Exception as e:
         logging.error(f"Error deleting employee: {str(e)}")
         return func.HttpResponse(
-            body=json.dumps({'error': str(e)}),
+            body=json.dumps({'warn': str(e)}),
             status_code=500,
             mimetype="application/json"
         )
@@ -4125,7 +4253,7 @@ async def update_employee(req: func.HttpRequest) -> func.HttpResponse:
 
         if not items:
             return func.HttpResponse(
-                json.dumps({'error': 'Employee not found'}), 
+                json.dumps({'warn': 'Employee not found'}), 
                 status_code=404, 
                 mimetype="application/json"
             )
@@ -4150,7 +4278,7 @@ async def update_employee(req: func.HttpRequest) -> func.HttpResponse:
             except Exception as e:
                 logging.error(f"Error handling image upload: {e}")
                 return func.HttpResponse(
-                    json.dumps({'error': f'Error processing image: {str(e)}'}), 
+                    json.dumps({'warn': f'Error processing image: {str(e)}'}), 
                     status_code=500, 
                     mimetype="application/json"
                 )
@@ -4197,7 +4325,7 @@ async def update_employee(req: func.HttpRequest) -> func.HttpResponse:
                 logging.error(f"Response body: {token_response.text}")
                 return func.HttpResponse(
                     body=json.dumps({
-                        'error': f"Failed to authenticate with Azure AD: {token_response.text}",
+                        'warn': f"Failed to authenticate with Azure AD: {token_response.text}",
                     }),
                     status_code=500,
                     mimetype="application/json"
@@ -4208,7 +4336,7 @@ async def update_employee(req: func.HttpRequest) -> func.HttpResponse:
                 logging.error(f"Unable to get token: {token_result.get('error')}")
                 return func.HttpResponse(
                     body=json.dumps({
-                        'error': 'Failed to authenticate with Azure AD',
+                        'warn': 'Failed to authenticate with Azure AD',
                     }),
                     status_code=500,
                     mimetype="application/json"
@@ -4222,19 +4350,21 @@ async def update_employee(req: func.HttpRequest) -> func.HttpResponse:
 
             # Make PATCH request to update the user in Azure AD B2C
             update_data_b2c = {
+                "displayName": item.get("employeeName"),
                 "givenName": item.get("employeeName"),
-                "jobTitle": item.get("role"),
-                "mail": item.get("email")
-            }
+                "jobTitle": item.get("role")
+                }
+
+            
 
             update_response = requests.patch(graph_url, headers=headers, json=update_data_b2c)
 
-            if update_response.status_code != 200:
+            if update_response.status_code not in [200, 204]:
                 logging.error(f"Error updating Azure AD B2C user: Status {update_response.status_code}")
                 logging.error(f"Response: {update_response.text}")
                 return func.HttpResponse(
                     body=json.dumps({
-                        'error': f"Failed to update user in Azure AD B2C: {update_response.text}"
+                        'warn': f"Failed to update user in Azure AD B2C: {update_response.text}"
                     }),
                     status_code=500,
                     mimetype="application/json"
@@ -4275,7 +4405,7 @@ async def update_employee(req: func.HttpRequest) -> func.HttpResponse:
     except Exception as e:
         logging.error(f"Unexpected error in update_employee: {e}")
         return func.HttpResponse(
-            json.dumps({'error': str(e)}),
+            json.dumps({'warn': str(e)}),
             status_code=500,
             mimetype="application/json"
         )
@@ -4359,7 +4489,7 @@ async def search_users(req: func.HttpRequest) -> func.HttpResponse:
         except Exception as e:
             logging.error(f"Cosmos DB Error: {str(e)}")
             return func.HttpResponse(
-                json.dumps({"detail": f"Database error: {str(e)}"}),
+                json.dumps({"warn": f"Database error: {str(e)}"}),
                 mimetype="application/json",
                 status_code=500
             )
@@ -4387,7 +4517,7 @@ async def search_users(req: func.HttpRequest) -> func.HttpResponse:
     except Exception as e:  # Outer try block needs an except clause
         logging.error(f"Unexpected error: {str(e)}")
         return func.HttpResponse(
-            json.dumps({"detail": f"An unexpected error occurred: {str(e)}"}),
+            json.dumps({"warn": f"An unexpected error occurred: {str(e)}"}),
             mimetype="application/json",
             status_code=500
         )
@@ -4407,7 +4537,7 @@ async def get_all_employees(req: func.HttpRequest) -> func.HttpResponse:
         if not organization_id:
             logging.error("Invalid token: organizationId (sub) missing")
             return func.HttpResponse(
-                json.dumps({"error": "Invalid token: organizationId (sub) missing"}),
+                json.dumps({"warn": "Invalid token: organizationId (sub) missing"}),
                 status_code=401,
                 mimetype="application/json"
             )
@@ -4439,7 +4569,182 @@ async def get_all_employees(req: func.HttpRequest) -> func.HttpResponse:
     except Exception as e:
         logging.error(f"Error fetching employees for organizationId {organization_id}: {str(e)}")
         return func.HttpResponse(
-            json.dumps({'error': "Internal server error"}),
+            json.dumps({'warn': "Internal server error"}),
             status_code=500,
             mimetype="application/json"
         )
+
+@app.function_name(name="checkUserExists")
+@app.route(route='api/checkUserExists', methods=[func.HttpMethod.GET])
+@require_auth
+async def check_user_exists(req: func.HttpRequest) -> func.HttpResponse:
+    user_info = req.user_info
+    organization_id = user_info['sub']
+   
+    try:
+        # Query for setup-details container (using organizationId)
+        setup_query = "SELECT VALUE COUNT(1) FROM c WHERE c.organization_id = @organization_id"
+        # Query for cameraUrls container (using organization_id)
+        camera_query = "SELECT VALUE COUNT(1) FROM c WHERE c.organizationId = @organization_id"
+       
+        parameters = [{"name": "@organization_id", "value": organization_id}]
+       
+        # Query setup-details container
+        setup_items = list(setup_container.query_items(
+            query=setup_query,
+            parameters=parameters,
+            enable_cross_partition_query=True
+        ))
+       
+        # Query cameraUrls container
+        camera_items = list(camera_urls_container.query_items(
+            query=camera_query,
+            parameters=parameters,
+            enable_cross_partition_query=True
+        ))
+       
+        # Check existence in each container
+        occupancy_exists = setup_items[0] > 0
+        attendance_exists = camera_items[0] > 0
+       
+        return func.HttpResponse(
+            json.dumps({
+                "data": {
+                    "occupancy": occupancy_exists,
+                    "attendance": attendance_exists,
+                    "message": "Checked organization ID in both containers"
+                }
+            }),
+            mimetype="application/json",
+            status_code=200
+        )
+    except Exception as e:
+        logging.error(f"Error checking if user exists: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"warn": "An error occurred while checking if the user exists."}),
+            mimetype="application/json",
+            status_code=500
+        )
+    
+
+
+def send_credentials_email(to_email: str, name: str, email: str, password: str):
+    sendgrid_api_key = os.getenv("SENDGRID_API_KEY")
+    sender_email = os.getenv("EMAIL_SENDER", os.getenv("FROM_EMAIL")) # Fallback if EMAIL_SENDER not found
+    template_id = os.getenv("EMAIL_TEMPLATE_ID", os.getenv("SENDGRID_TEMPLATE_ID")) # Fallback
+    
+    message = Mail(
+        from_email=From(sender_email, "Yectra"),
+        to_emails=To(to_email)
+    )
+    
+    message.dynamic_template_data = {
+        "name": name,
+        "email": email,
+        "password": password,
+        "employeeName": name,  # Adding these to match your original code
+        "otp": password[:6]    # Adding these to match your original code
+    }
+
+    message.template_id = template_id
+
+    try:
+        sg = SendGridAPIClient(sendgrid_api_key)
+        response = sg.send(message)
+        logging.info(f"Dynamic template email sent to {to_email}. Status code: {response.status_code}")
+        return True
+    except Exception as e:
+        logging.error(f"Error sending email to {to_email}: {str(e)}")
+        return False
+
+
+
+# get all attendance
+@app.function_name(name="get_all_attendance")
+@app.route(route='attendance/all', methods=[func.HttpMethod.GET])
+@require_auth
+async def get_all_attendance(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Retrieve attendance records by organizationId with optional filtering by employeeId and date.
+    Includes pagination and sorting by date (latest first).
+    """
+    logging.info(f"Token validated for user: {req.user_info.get('email', 'unknown')}")
+
+    try:
+        # Extract organizationId from user info (sub)
+        user_info = req.user_info
+        organization_id = user_info.get("sub")  # This should be the actual org ID
+
+        if not organization_id:
+            return func.HttpResponse(
+                body=json.dumps({'warn': 'Unauthorized. Missing organization ID.'}),
+                status_code=401,
+                mimetype="application/json"
+            )
+
+        # Pagination parameters
+        page_number = int(req.params.get('page_number', 1))
+        page_size = int(req.params.get('page_size', 10))
+        offset = (page_number - 1) * page_size
+        from_date = req.params.get('from_date')   # New: start of date range
+        to_date = req.params.get('to_date')       # New: end of date range
+
+
+        # Optional filters
+        employee_id = req.params.get('employeeId')
+        attendance_date = req.params.get('date')  # Format: YYYY-MM-DD
+
+        # Base query with organization filter
+        query = "SELECT * FROM c WHERE c.organizationId = @orgId"
+        parameters = [{"name": "@orgId", "value": organization_id}]
+
+        if employee_id:
+            query += " AND c.employeeId = @employeeId"
+            parameters.append({"name": "@employeeId", "value": employee_id})
+
+        if attendance_date:
+            query += " AND c.date = @attendanceDate"
+            parameters.append({"name": "@attendanceDate", "value": attendance_date})
+
+        if from_date:
+            query += " AND c.date >= @fromDate"
+            parameters.append({"name": "@fromDate", "value": from_date})
+
+        if to_date:
+            query += " AND c.date <= @toDate"
+            parameters.append({"name": "@toDate", "value": to_date})
+    
+
+        query += " ORDER BY c.date DESC"
+
+        # Query Cosmos DB
+        all_items = list(attendance_container.query_items(
+            query=query,
+            parameters=parameters,
+            enable_cross_partition_query=True
+        ))
+
+        # Paginate results
+        paginated_items = all_items[offset:offset + page_size]
+
+        return func.HttpResponse(
+            body=json.dumps({
+                "page_number": page_number,
+                "page_size": page_size,
+                "total_records": len(all_items),
+                "data": paginated_items
+            }),
+            status_code=200,
+            mimetype="application/json"
+        )
+
+    except Exception as e:
+        logging.error(f"Error fetching attendance records: {str(e)}")
+        return func.HttpResponse(
+            body=json.dumps({'warn': 'Internal Server Error'}),
+            status_code=500,
+            mimetype="application/json"
+        )
+
+
+
