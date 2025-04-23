@@ -16,7 +16,7 @@ import base64
 import numpy as np
 import pendulum
 import datetime
-from datetime import datetime,date
+from datetime import datetime,date,timedelta
 import requests
 import re
 from datetime import timedelta
@@ -365,87 +365,92 @@ class CameraUrls(BaseModel):
 @require_auth
 async def search_attendance(req: func.HttpRequest) -> func.HttpResponse:
     try:
-        logging.info(f"Token validated for user: {req.user_info.get('email', 'unknown')}")
+        user_sub = req.user_info.get("sub")  # Organization ID from token
+        if not user_sub:
+            return func.HttpResponse(
+                body=json.dumps({'error': 'Invalid user token. Missing organization identifier.'}),
+                status_code=401,
+                mimetype="application/json"
+            )
 
-        # Retrieve query parameters
-        employee_id = req.params.get('employeeId')
-        employee_name = req.params.get('employeeName')
-        date = req.params.get('date')
-        page_number = req.params.get('page_number', 1)
-        page_size = req.params.get('page_size', 10)
+        # Parameters
+        search_query = req.params.get('search')  # for employeeName or email
+        period = req.params.get('period')  # today, yesterday, week, month
+        start_date = req.params.get('start_date')  # optional custom range
+        end_date = req.params.get('end_date')
+        page_number = int(req.params.get('page_number', 1))
+        page_size = int(req.params.get('page_size', 10))
 
-        logging.info(f"Search Parameters - employee_id: {employee_id}, employee_name: {employee_name}, date: {date}, page_number: {page_number}, page_size: {page_size}")
+        logging.info(f"Search Attendance for OrgID (sub): {user_sub}, Search: {search_query}, Period: {period}, Start: {start_date}, End: {end_date}")
 
-        # Validate pagination parameters
-        try:
-            page_number = int(page_number)
-            page_size = int(page_size)
-            if page_number < 1 or page_size < 1:
+        query_conditions = ["c.organizationId = @org_id"]
+        parameters = [{"name": "@org_id", "value": user_sub}]
+
+        # Search across employeeName or email
+        if search_query:
+            query_conditions.append("(CONTAINS(LOWER(c.employeeName), LOWER(@search)) OR CONTAINS(LOWER(c.email), LOWER(@search)))")
+            parameters.append({"name": "@search", "value": search_query.lower()})
+
+        # Period-based filtering
+        if period:
+            today = datetime.utcnow().date()
+            if period.lower() == "today":
+                start = end = today
+            elif period.lower() == "yesterday":
+                start = end = today - timedelta(days=1)
+            elif period.lower() == "week":
+                start = today - timedelta(days=7)
+                end = today
+            elif period.lower() == "month":
+                start = today - timedelta(days=30)
+                end = today
+            else:
                 return func.HttpResponse(
-                    body=json.dumps({'warn': 'page_number and page_size must be positive integers'}),
+                    body=json.dumps({'error': 'Invalid period. Use today, yesterday, week, or month.'}),
                     status_code=400,
                     mimetype="application/json"
                 )
-        except ValueError:
-            return func.HttpResponse(
-                body=json.dumps({'warn': 'Invalid page_number or page_size. They must be integers.'}),
-                status_code=400,
-                mimetype="application/json"
-            )
+            query_conditions.append("c.date >= @start_date AND c.date <= @end_date")
+            parameters.append({"name": "@start_date", "value": start.strftime("%Y-%m-%d")})
+            parameters.append({"name": "@end_date", "value": end.strftime("%Y-%m-%d")})
 
-        if not (employee_id or employee_name or date):
-            return func.HttpResponse(
-                body=json.dumps({'warn': 'At least one search parameter (employeeId, employeeName, or date) is required'}),
-                status_code=400,
-                mimetype="application/json"
-            )
+        # Custom start_date and end_date override
+        if start_date and end_date:
+            query_conditions.append("c.date >= @custom_start AND c.date <= @custom_end")
+            parameters.append({"name": "@custom_start", "value": start_date})
+            parameters.append({"name": "@custom_end", "value": end_date})
 
-        # Construct query conditions
-        query_conditions = []
-        parameters = []
-
-        if employee_id:
-            query_conditions.append("c.employeeId = @employee_id")
-            parameters.append({"name": "@employee_id", "value": int(employee_id)})
-
-        if employee_name:
-            query_conditions.append("STARTSWITH(LOWER(c.employeeName), LOWER(@employee_name))")
-            parameters.append({"name": "@employee_name", "value": employee_name.lower()})
-
-        if date:
-            query_conditions.append("c.date = @date")
-            parameters.append({"name": "@date", "value": date})
-
-        # Construct the query with pagination
         query = "SELECT * FROM c WHERE " + " AND ".join(query_conditions)
         query += " ORDER BY c.employeeId ASC"
-        query += f" OFFSET {(page_number - 1) * page_size} LIMIT {page_size}"
 
-        logging.info(f"Constructed query: {query}")
+        all_items = list(attendance_container.query_items(
+            query=query,
+            parameters=parameters,
+            enable_cross_partition_query=True
+        ))
 
-        # Execute query
-        items = list(attendance_container.query_items(query=query, parameters=parameters, enable_cross_partition_query=True))
-
-        if items:
-            return func.HttpResponse(
-                body=json.dumps(items),
-                status_code=200,
-                mimetype="application/json"
-            )
+        offset = (page_number - 1) * page_size
+        paginated_items = all_items[offset:offset + page_size]
 
         return func.HttpResponse(
-            body=json.dumps({'warn': 'No matching attendance records found'}),
-            status_code=404,
+            body=json.dumps({
+                "page_number": page_number,
+                "page_size": page_size,
+                "total_records": len(all_items),
+                "data": paginated_items
+            }),
+            status_code=200,
             mimetype="application/json"
         )
 
-    except exceptions.CosmosHttpResponseError as e:
-        logging.error(f"Failed to search attendance records: {str(e)}")
+    except Exception as e:
+        logging.error(f"Error during attendance search: {str(e)}")
         return func.HttpResponse(
-            body=json.dumps({'warn': f'Failed to search attendance records: {e.message}'}),
+            body=json.dumps({'error': 'Internal Server Error'}),
             status_code=500,
             mimetype="application/json"
         )
+
 
 
 
@@ -867,79 +872,108 @@ def fetch_employee_image(employee_id):
         return None
 
 
-# @app.function_name(name="get_all_attendance")
-# @app.route(route='attendance/all', methods=[func.HttpMethod.GET])
-# @require_auth
-# async def get_all_attendance(req: func.HttpRequest) -> func.HttpResponse:
-#     """
-#     Retrieve attendance records by organizationId with optional filtering by employeeId and date.
-#     Includes pagination and sorting by date (latest first).
-#     """
-#     logging.info(f"Token validated for user: {req.user_info.get('email', 'unknown')}")
 
-#     try:
-#         # Extract organizationId from user info (sub)
-#         user_info = req.user_info
-#         organization_id = user_info.get("sub")  # This should be the actual org ID
 
-#         if not organization_id:
-#             return func.HttpResponse(
-#                 body=json.dumps({'error': 'Unauthorized. Missing organization ID.'}),
-#                 status_code=401,
-#                 mimetype="application/json"
-#             )
+@app.function_name(name="get_all_attendance")
+@app.route(route='attendance/all', methods=[func.HttpMethod.GET])
+@require_auth
+async def get_all_attendance(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Retrieve attendance records by organizationId with optional filtering by employeeId, 
+    start_date/end_date, or predefined period (today, yesterday, week, month).
+    Includes pagination and sorting by date (latest first).
+    """
+    logging.info(f"Token validated for user: {req.user_info.get('email', 'unknown')}")
 
-#         # Pagination parameters
-#         page_number = int(req.params.get('page_number', 1))
-#         page_size = int(req.params.get('page_size', 10))
-#         offset = (page_number - 1) * page_size
+    try:
+        user_info = req.user_info
+        organization_id = user_info.get("sub")
 
-#         # Optional filters
-#         employee_id = req.params.get('employeeId')
-#         attendance_date = req.params.get('date')  # Format: YYYY-MM-DD
+        if not organization_id:
+            return func.HttpResponse(
+                body=json.dumps({'error': 'Unauthorized. Missing organization ID.'}),
+                status_code=401,
+                mimetype="application/json"
+            )
 
-#         # Base query with organization filter
-#         query = "SELECT * FROM c WHERE c.organizationId = @orgId"
-#         parameters = [{"name": "@orgId", "value": organization_id}]
+        # Pagination
+        page_number = int(req.params.get('page_number', 1))
+        page_size = int(req.params.get('page_size', 10))
+        offset = (page_number - 1) * page_size
 
-#         if employee_id:
-#             query += " AND c.employeeId = @employeeId"
-#             parameters.append({"name": "@employeeId", "value": employee_id})
+        # Filters
+        employee_id = req.params.get('employeeId')
+        start_date = req.params.get('start_date')
+        end_date = req.params.get('end_date')
+        period = req.params.get('period')  # today, yesterday, week, month
 
-#         if attendance_date:
-#             query += " AND c.date = @attendanceDate"
-#             parameters.append({"name": "@attendanceDate", "value": attendance_date})
+        query = "SELECT * FROM c WHERE c.organizationId = @orgId"
+        parameters = [{"name": "@orgId", "value": organization_id}]
 
-#         query += " ORDER BY c.date DESC"
+        if employee_id:
+            query += " AND c.employeeId = @employeeId"
+            parameters.append({"name": "@employeeId", "value": employee_id})
 
-#         # Query Cosmos DB
-#         all_items = list(attendance_container.query_items(
-#             query=query,
-#             parameters=parameters,
-#             enable_cross_partition_query=True
-#         ))
+        # Handle predefined period
+        if period:
+            today = datetime.utcnow().date()
 
-#         # Paginate results
-#         paginated_items = all_items[offset:offset + page_size]
+            if period.lower() == "today":
+                start = end = today
+            elif period.lower() == "yesterday":
+                start = end = today - timedelta(days=1)
+            elif period.lower() == "week":
+                start = today - timedelta(days=7)
+                end = today
+            elif period.lower() == "month":
+                start = today - timedelta(days=30)
+                end = today
+            else:
+                return func.HttpResponse(
+                    body=json.dumps({'error': 'Invalid period. Use today, yesterday, week, or month.'}),
+                    status_code=400,
+                    mimetype="application/json"
+                )
 
-#         return func.HttpResponse(
-#             body=json.dumps({
-#                 "page_number": page_number,
-#                 "page_size": page_size,
-#                 "total_records": len(all_items),
-#                 "data": paginated_items
-#             }),
-#             status_code=200,
-#             mimetype="application/json"
-#         )
+            query += " AND c.date >= @startDate AND c.date <= @endDate"
+            parameters.append({"name": "@startDate", "value": start.strftime("%Y-%m-%d")})
+            parameters.append({"name": "@endDate", "value": end.strftime("%Y-%m-%d")})
 
-#     except Exception as e:
-#         logging.error(f"Error fetching attendance records: {str(e)}")
-#         return func.HttpResponse(
-#             body=json.dumps({'error': 'Internal Server Error'}),
-#             status_code=500,
-#             mimetype="application/json"
-#         )
+        # If custom date range provided
+        elif start_date and end_date:
+            query += " AND c.date >= @startDate AND c.date <= @endDate"
+            parameters.append({"name": "@startDate", "value": start_date})
+            parameters.append({"name": "@endDate", "value": end_date})
+
+        query += " ORDER BY c.date DESC"
+
+        all_items = list(attendance_container.query_items(
+            query=query,
+            parameters=parameters,
+            enable_cross_partition_query=True
+        ))
+
+        paginated_items = all_items[offset:offset + page_size]
+
+        return func.HttpResponse(
+            body=json.dumps({
+                "page_number": page_number,
+                "page_size": page_size,
+                "total_records": len(all_items),
+                "data": paginated_items
+            }),
+            status_code=200,
+            mimetype="application/json"
+        )
+
+    except Exception as e:
+        logging.error(f"Error fetching attendance records: {str(e)}")
+        return func.HttpResponse(
+            body=json.dumps({'error': 'Internal Server Error'}),
+            status_code=500,
+            mimetype="application/json"
+        )
+
 
 
 
@@ -2282,22 +2316,75 @@ async def get_person_count_by_date(req: func.HttpRequest) -> func.HttpResponse:
    
     # Initialize containers
     users_container = database.get_container_client(USERS)
+    user_logs_container = database.get_container_client(USER_LOGS)  # Ensure this is defined
    
-    # Get the date parameter from the request query string
-    # If not provided, use current date
+    # Get date parameters from the request query string
     date_param = req.params.get('date')
-    if not date_param:
-        # Use current date if no date parameter is provided
-        selected_date = pendulum.now().format('YYYY-MM-DD')
-    else:
-        # Parse and validate the date format (YYYY-MM-DD)
+    start_date_param = req.params.get('start_date')
+    end_date_param = req.params.get('end_date')
+    period_param = req.params.get('period')  # New parameter for yesterday, week, month
+   
+    # Determine if we're processing a single date, date range, or period
+    if period_param in ['yesterday', 'week', 'month']:
         try:
-            selected_date = pendulum.parse(date_param).format('YYYY-MM-DD')
+            today = pendulum.now().start_of('day')
+            if period_param == 'yesterday':
+                start_date = today.subtract(days=1).start_of('day')
+                end_date = today.subtract(days=1).end_of('day')
+                selected_date = start_date.format('YYYY-MM-DD')
+                mode = "single"
+            elif period_param == 'week':
+                # Current week: from Monday to today (or end of week)
+                start_date = today.start_of('week')  # Monday of the current week
+                end_date = today.end_of('day')  # Up to today
+                # Alternative: end_date = today.end_of('week')  # Sunday of the current week
+                mode = "range"
+                selected_date = None
+            elif period_param == 'month':
+                # Current month: from 1st of the month to today (or end of month)
+                start_date = today.start_of('month')  # 1st of the current month
+                end_date = today.end_of('day')  # Up to today
+                # Alternative: end_date = today.end_of('month')  # Last day of the month
+                mode = "range"
+                selected_date = None
         except Exception as e:
             return func.HttpResponse(
-                json.dumps({"warn": f"Invalid date format. Please use YYYY-MM-DD. Details: {str(e)}"}),
+                json.dumps({"warn": f"Invalid period parameter. Details: {str(e)}"}),
                 status_code=400
             )
+    elif start_date_param and end_date_param:
+        # Validate and parse date range
+        try:
+            start_date = pendulum.parse(start_date_param).start_of('day')
+            end_date = pendulum.parse(end_date_param).end_of('day')
+            if start_date > end_date:
+                return func.HttpResponse(
+                    json.dumps({"warn": "start_date cannot be after end_date"}),
+                    status_code=400
+                )
+            mode = "range"
+            selected_date = None
+        except Exception as e:
+            return func.HttpResponse(
+                json.dumps({"warn": f"Invalid date format for start_date or end_date. Please use YYYY-MM-DD. Details: {str(e)}"}),
+                status_code=400
+            )
+    else:
+        # Single date mode
+        if date_param:
+            try:
+                selected_date = pendulum.parse(date_param).format('YYYY-MM-DD')
+            except Exception as e:
+                return func.HttpResponse(
+                    json.dumps({"warn": f"Invalid date format. Please use YYYY-MM-DD. Details: {str(e)}"}),
+                    status_code=400
+                )
+        else:
+            # Default to current date
+            selected_date = pendulum.now().format('YYYY-MM-DD')
+        start_date = pendulum.parse(selected_date).start_of('day')
+        end_date = pendulum.parse(selected_date).end_of('day')
+        mode = "single"
    
     try:
         # First check users container for organization_id
@@ -2333,16 +2420,23 @@ async def get_person_count_by_date(req: func.HttpRequest) -> func.HttpResponse:
  
         if not logs_items or "logs" not in logs_items[0]:
             # Return empty data with the simplified structure
+            response_data = {
+                "data": {
+                    "total_entries": 0,
+                    "total_exits": 0,
+                    "total_count": 0,
+                    "camera_data": []
+                }
+            }
+            if mode == "single":
+                response_data["data"]["date"] = selected_date
+            else:
+                response_data["data"]["date_range"] = {
+                    "start_date": start_date.format('YYYY-MM-DD'),
+                    "end_date": end_date.format('YYYY-MM-DD')
+                }
             return func.HttpResponse(
-                json.dumps({
-                    "data": {
-                        "date": selected_date,
-                        "total_entries": 0,
-                        "total_exits": 0,
-                        "total_count": 0,
-                        "camera_data": []
-                    }
-                }),
+                json.dumps(response_data),
                 status_code=200,
                 mimetype="application/json"
             )
@@ -2352,7 +2446,7 @@ async def get_person_count_by_date(req: func.HttpRequest) -> func.HttpResponse:
         camera_exit_counts = defaultdict(int)
         all_cameras = set()
        
-        # Process logs and filter by selected date
+        # Process logs and filter by date or date range
         logs = logs_items[0].get("logs", [])
         for log in logs:
             timestamp = log.get("timestamp")
@@ -2361,10 +2455,11 @@ async def get_person_count_by_date(req: func.HttpRequest) -> func.HttpResponse:
  
             if timestamp and camera_id and event_type:
                 try:
-                    # Parse timestamp and check if it's on the selected date
-                    log_date = pendulum.parse(timestamp).format('YYYY-MM-DD')
+                    # Parse timestamp
+                    log_datetime = pendulum.parse(timestamp)
                    
-                    if log_date == selected_date:
+                    # Check if the log falls within the date range
+                    if start_date <= log_datetime <= end_date:
                         all_cameras.add(camera_id)
                        
                         if event_type == "person_entry":
@@ -2398,16 +2493,24 @@ async def get_person_count_by_date(req: func.HttpRequest) -> func.HttpResponse:
         camera_data.sort(key=lambda x: x["camera_id"])
        
         # Prepare the response with the simplified format
+        response_data = {
+            "data": {
+                "total_entries": total_entries,
+                "total_exits": total_exits,
+                "total_count": total_count,
+                "camera_data": camera_data
+            }
+        }
+        if mode == "single":
+            response_data["data"]["date"] = selected_date
+        else:
+            response_data["data"]["date_range"] = {
+                "start_date": start_date.format('YYYY-MM-DD'),
+                "end_date": end_date.format('YYYY-MM-DD')
+            }
+       
         return func.HttpResponse(
-            json.dumps({
-                "data": {
-                    "date": selected_date,
-                    "total_entries": total_entries,
-                    "total_exits": total_exits,
-                    "total_count": total_count,
-                    "camera_data": camera_data
-                }
-            }),
+            json.dumps(response_data),
             status_code=200,
             mimetype="application/json"
         )
@@ -2418,7 +2521,7 @@ async def get_person_count_by_date(req: func.HttpRequest) -> func.HttpResponse:
             json.dumps({"warn": f"An unexpected error occurred: {str(e)}"}),
             status_code=500,
             mimetype="application/json"
-        )    
+        )   
     
 
 @app.route(route="update_organization_camera_data", methods=["PUT"])
@@ -2429,29 +2532,33 @@ async def update_organization_camera_data(req: func.HttpRequest) -> func.HttpRes
         camera_data = req_body.get("cameraData")
 
         if not organization_data or not camera_data:
-            return func.HttpResponse("Both organizationData and cameraData are required.", status_code=400)
+            return func.HttpResponse(
+                json.dumps({"warn": "Both organizationData and cameraData are required."}),
+                status_code=400,
+                mimetype="application/json"
+            )
 
         # Validate mandatory fields
         mandatory_org_fields = [
             "organizationId", "organizationName", "phoneNumber",
-            "websiteUrl","address"
+            "websiteUrl"
         ]
         mandatory_cam_fields = ["organizationId", "email", "cameraDetails"]
 
         for field in mandatory_org_fields:
             if field not in organization_data:
-                return func.HttpResponse(f"Missing mandatory field in organizationData: {field}", status_code=400)
+                return func.HttpResponse(f"warn: Missing mandatory field in organizationData: {field}", status_code=400)
 
         for field in mandatory_cam_fields:
             if field not in camera_data:
-                return func.HttpResponse(f"Missing mandatory field in cameraData: {field}", status_code=400)
+                return func.HttpResponse(f"warn: Missing mandatory field in cameraData: {field}", status_code=400)
 
         # Convert workTiming to an integer if it exists
         if "workTiming" in organization_data:
             try:
                 organization_data["workTiming"] = int(organization_data["workTiming"])
             except ValueError:
-                return func.HttpResponse("Invalid workTiming value. Must be a number.", status_code=400)
+                return func.HttpResponse("warn: Invalid workTiming value. Must be a number.", status_code=400)
 
         # Upsert (Insert or Update) organization data
         organization_container_name.upsert_item(organization_data)
@@ -2462,7 +2569,7 @@ async def update_organization_camera_data(req: func.HttpRequest) -> func.HttpRes
         return func.HttpResponse("Organization and camera data updated successfully", status_code=200)
 
     except exceptions.CosmosHttpResponseError as e:
-        return func.HttpResponse(f"warn: Cosmos DB Error: {str(e)}", status_code=500)
+        return func.HttpResponse(f"warn:" "Cosmos DB Error: {str(e)}", status_code=500)
     except Exception as e:
         return func.HttpResponse(f"warn: {str(e)}", status_code=500)
 
@@ -4432,25 +4539,15 @@ async def search_users(req: func.HttpRequest) -> func.HttpResponse:
        
         valid_roles = ['user', 'admin']
        
-        # Parse search term
-        name_filter = search_term
-        role_filter = None
-       
-        words = search_term.split()
-        for word in words:
-            if word in valid_roles:
-                detected_role = word.capitalize()
-                role_filter = detected_role
-                name_filter = search_term.replace(word, '').strip()
-                break
-       
-        if name_filter:
-            query += " AND LOWER(c.name) LIKE @name"
-            query_params.append({"name": "@name", "value": f"%{name_filter}%"})
+        # Apply search term to both name and role
+        if search_term:
+            # Search for name with partial match
+            query += " AND (LOWER(c.name) LIKE @name"
+            query_params.append({"name": "@name", "value": f"%{search_term}%"})
            
-        if role_filter:
-            query += " AND c.role = @role"
-            query_params.append({"name": "@role", "value": role_filter})
+            # Search for role with partial match
+            query += " OR LOWER(c.role) LIKE @role)"
+            query_params.append({"name": "@role", "value": f"%{search_term}%"})
        
         query_options = {
             'enable_cross_partition_query': True
@@ -4486,10 +4583,10 @@ async def search_users(req: func.HttpRequest) -> func.HttpResponse:
                 }
                 users.append(clean_user)
                
-        except Exception as e:
+        except exceptions as e:
             logging.error(f"Cosmos DB Error: {str(e)}")
             return func.HttpResponse(
-                json.dumps({"warn": f"Database error: {str(e)}"}),
+                json.dumps({"detail": f"Database error: {str(e)}"}),
                 mimetype="application/json",
                 status_code=500
             )
@@ -4501,8 +4598,6 @@ async def search_users(req: func.HttpRequest) -> func.HttpResponse:
                 "count": len(users),
                 "search_criteria": {
                     "search_term": search_term if search_term else None,
-                    "detected_name": name_filter if name_filter else None,
-                    "detected_role": role_filter if role_filter else None,
                     "organization_id": organization_id
                 }
             }
@@ -4514,10 +4609,10 @@ async def search_users(req: func.HttpRequest) -> func.HttpResponse:
             status_code=200
         )
    
-    except Exception as e:  # Outer try block needs an except clause
+    except Exception as e:
         logging.error(f"Unexpected error: {str(e)}")
         return func.HttpResponse(
-            json.dumps({"warn": f"An unexpected error occurred: {str(e)}"}),
+            json.dumps({"detail": f"An unexpected error occurred: {str(e)}"}),
             mimetype="application/json",
             status_code=500
         )
@@ -4659,92 +4754,92 @@ def send_credentials_email(to_email: str, name: str, email: str, password: str):
 
 
 
-# get all attendance
-@app.function_name(name="get_all_attendance")
-@app.route(route='attendance/all', methods=[func.HttpMethod.GET])
-@require_auth
-async def get_all_attendance(req: func.HttpRequest) -> func.HttpResponse:
-    """
-    Retrieve attendance records by organizationId with optional filtering by employeeId and date.
-    Includes pagination and sorting by date (latest first).
-    """
-    logging.info(f"Token validated for user: {req.user_info.get('email', 'unknown')}")
+# # get all attendance
+# @app.function_name(name="get_all_attendance")
+# @app.route(route='attendance/all', methods=[func.HttpMethod.GET])
+# @require_auth
+# async def get_all_attendance(req: func.HttpRequest) -> func.HttpResponse:
+#     """
+#     Retrieve attendance records by organizationId with optional filtering by employeeId and date.
+#     Includes pagination and sorting by date (latest first).
+#     """
+#     logging.info(f"Token validated for user: {req.user_info.get('email', 'unknown')}")
 
-    try:
-        # Extract organizationId from user info (sub)
-        user_info = req.user_info
-        organization_id = user_info.get("sub")  # This should be the actual org ID
+#     try:
+#         # Extract organizationId from user info (sub)
+#         user_info = req.user_info
+#         organization_id = user_info.get("sub")  # This should be the actual org ID
 
-        if not organization_id:
-            return func.HttpResponse(
-                body=json.dumps({'warn': 'Unauthorized. Missing organization ID.'}),
-                status_code=401,
-                mimetype="application/json"
-            )
+#         if not organization_id:
+#             return func.HttpResponse(
+#                 body=json.dumps({'warn': 'Unauthorized. Missing organization ID.'}),
+#                 status_code=401,
+#                 mimetype="application/json"
+#             )
 
-        # Pagination parameters
-        page_number = int(req.params.get('page_number', 1))
-        page_size = int(req.params.get('page_size', 10))
-        offset = (page_number - 1) * page_size
-        from_date = req.params.get('from_date')   # New: start of date range
-        to_date = req.params.get('to_date')       # New: end of date range
+#         # Pagination parameters
+#         page_number = int(req.params.get('page_number', 1))
+#         page_size = int(req.params.get('page_size', 10))
+#         offset = (page_number - 1) * page_size
+#         from_date = req.params.get('from_date')   # New: start of date range
+#         to_date = req.params.get('to_date')       # New: end of date range
 
 
-        # Optional filters
-        employee_id = req.params.get('employeeId')
-        attendance_date = req.params.get('date')  # Format: YYYY-MM-DD
+#         # Optional filters
+#         employee_id = req.params.get('employeeId')
+#         attendance_date = req.params.get('date')  # Format: YYYY-MM-DD
 
-        # Base query with organization filter
-        query = "SELECT * FROM c WHERE c.organizationId = @orgId"
-        parameters = [{"name": "@orgId", "value": organization_id}]
+#         # Base query with organization filter
+#         query = "SELECT * FROM c WHERE c.organizationId = @orgId"
+#         parameters = [{"name": "@orgId", "value": organization_id}]
 
-        if employee_id:
-            query += " AND c.employeeId = @employeeId"
-            parameters.append({"name": "@employeeId", "value": employee_id})
+#         if employee_id:
+#             query += " AND c.employeeId = @employeeId"
+#             parameters.append({"name": "@employeeId", "value": employee_id})
 
-        if attendance_date:
-            query += " AND c.date = @attendanceDate"
-            parameters.append({"name": "@attendanceDate", "value": attendance_date})
+#         if attendance_date:
+#             query += " AND c.date = @attendanceDate"
+#             parameters.append({"name": "@attendanceDate", "value": attendance_date})
 
-        if from_date:
-            query += " AND c.date >= @fromDate"
-            parameters.append({"name": "@fromDate", "value": from_date})
+#         if from_date:
+#             query += " AND c.date >= @fromDate"
+#             parameters.append({"name": "@fromDate", "value": from_date})
 
-        if to_date:
-            query += " AND c.date <= @toDate"
-            parameters.append({"name": "@toDate", "value": to_date})
+#         if to_date:
+#             query += " AND c.date <= @toDate"
+#             parameters.append({"name": "@toDate", "value": to_date})
     
 
-        query += " ORDER BY c.date DESC"
+#         query += " ORDER BY c.date DESC"
 
-        # Query Cosmos DB
-        all_items = list(attendance_container.query_items(
-            query=query,
-            parameters=parameters,
-            enable_cross_partition_query=True
-        ))
+#         # Query Cosmos DB
+#         all_items = list(attendance_container.query_items(
+#             query=query,
+#             parameters=parameters,
+#             enable_cross_partition_query=True
+#         ))
 
-        # Paginate results
-        paginated_items = all_items[offset:offset + page_size]
+#         # Paginate results
+#         paginated_items = all_items[offset:offset + page_size]
 
-        return func.HttpResponse(
-            body=json.dumps({
-                "page_number": page_number,
-                "page_size": page_size,
-                "total_records": len(all_items),
-                "data": paginated_items
-            }),
-            status_code=200,
-            mimetype="application/json"
-        )
+#         return func.HttpResponse(
+#             body=json.dumps({
+#                 "page_number": page_number,
+#                 "page_size": page_size,
+#                 "total_records": len(all_items),
+#                 "data": paginated_items
+#             }),
+#             status_code=200,
+#             mimetype="application/json"
+#         )
 
-    except Exception as e:
-        logging.error(f"Error fetching attendance records: {str(e)}")
-        return func.HttpResponse(
-            body=json.dumps({'warn': 'Internal Server Error'}),
-            status_code=500,
-            mimetype="application/json"
-        )
+#     except Exception as e:
+#         logging.error(f"Error fetching attendance records: {str(e)}")
+#         return func.HttpResponse(
+#             body=json.dumps({'warn': 'Internal Server Error'}),
+#             status_code=500,
+#             mimetype="application/json"
+#         )
 
 
 
