@@ -38,7 +38,7 @@ from azure.core.exceptions import HttpResponseError
 import urllib.parse
 from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail, From, To
-
+import time
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
 
 # Load environment variables from .env file
@@ -375,23 +375,31 @@ async def search_attendance(req: func.HttpRequest) -> func.HttpResponse:
 
         # Parameters
         search_query = req.params.get('search')  # for employeeName or email
-        period = req.params.get('period')  # today, yesterday, week, month
-        start_date = req.params.get('start_date')  # optional custom range
+        period = req.params.get('period')        # today, yesterday, week, month
+        start_date = req.params.get('start_date')
         end_date = req.params.get('end_date')
+        employee_id = req.params.get('employeeId')  # new optional parameter
+        specific_date = req.params.get('date')      # new optional parameter
         page_number = int(req.params.get('page_number', 1))
         page_size = int(req.params.get('page_size', 10))
 
-        logging.info(f"Search Attendance for OrgID (sub): {user_sub}, Search: {search_query}, Period: {period}, Start: {start_date}, End: {end_date}")
+        logging.info(f"Search Attendance for OrgID (sub): {user_sub}, Search: {search_query}, Period: {period}, Start: {start_date}, End: {end_date}, EmployeeID: {employee_id}, Date: {specific_date}")
 
         query_conditions = ["c.organizationId = @org_id"]
         parameters = [{"name": "@org_id", "value": user_sub}]
 
-        # Search across employeeName or email
         if search_query:
             query_conditions.append("(CONTAINS(LOWER(c.employeeName), LOWER(@search)) OR CONTAINS(LOWER(c.email), LOWER(@search)))")
             parameters.append({"name": "@search", "value": search_query.lower()})
 
-        # Period-based filtering
+        if employee_id:
+            query_conditions.append("c.employeeId = @employee_id")
+            parameters.append({"name": "@employee_id", "value": employee_id})
+
+        if specific_date:
+            query_conditions.append("c.date = @specific_date")
+            parameters.append({"name": "@specific_date", "value": specific_date})
+
         if period:
             today = datetime.utcnow().date()
             if period.lower() == "today":
@@ -414,7 +422,6 @@ async def search_attendance(req: func.HttpRequest) -> func.HttpResponse:
             parameters.append({"name": "@start_date", "value": start.strftime("%Y-%m-%d")})
             parameters.append({"name": "@end_date", "value": end.strftime("%Y-%m-%d")})
 
-        # Custom start_date and end_date override
         if start_date and end_date:
             query_conditions.append("c.date >= @custom_start AND c.date <= @custom_end")
             parameters.append({"name": "@custom_start", "value": start_date})
@@ -450,6 +457,7 @@ async def search_attendance(req: func.HttpRequest) -> func.HttpResponse:
             status_code=500,
             mimetype="application/json"
         )
+
 
 
 
@@ -880,7 +888,7 @@ def fetch_employee_image(employee_id):
 async def get_all_attendance(req: func.HttpRequest) -> func.HttpResponse:
     """
     Retrieve attendance records by organizationId with optional filtering by employeeId, 
-    start_date/end_date, or predefined period (today, yesterday, week, month).
+    a specific date, start_date/end_date, or predefined period (today, yesterday, week, month).
     Includes pagination and sorting by date (latest first).
     """
     logging.info(f"Token validated for user: {req.user_info.get('email', 'unknown')}")
@@ -906,6 +914,7 @@ async def get_all_attendance(req: func.HttpRequest) -> func.HttpResponse:
         start_date = req.params.get('start_date')
         end_date = req.params.get('end_date')
         period = req.params.get('period')  # today, yesterday, week, month
+        specific_date = req.params.get('date')  # Exact date filter
 
         query = "SELECT * FROM c WHERE c.organizationId = @orgId"
         parameters = [{"name": "@orgId", "value": organization_id}]
@@ -914,8 +923,13 @@ async def get_all_attendance(req: func.HttpRequest) -> func.HttpResponse:
             query += " AND c.employeeId = @employeeId"
             parameters.append({"name": "@employeeId", "value": employee_id})
 
-        # Handle predefined period
-        if period:
+        # If exact date is provided
+        if specific_date:
+            query += " AND c.date = @specificDate"
+            parameters.append({"name": "@specificDate", "value": specific_date})
+
+        # If predefined period is provided
+        elif period:
             today = datetime.utcnow().date()
 
             if period.lower() == "today":
@@ -939,12 +953,13 @@ async def get_all_attendance(req: func.HttpRequest) -> func.HttpResponse:
             parameters.append({"name": "@startDate", "value": start.strftime("%Y-%m-%d")})
             parameters.append({"name": "@endDate", "value": end.strftime("%Y-%m-%d")})
 
-        # If custom date range provided
+        # If custom start and end dates are provided
         elif start_date and end_date:
             query += " AND c.date >= @startDate AND c.date <= @endDate"
             parameters.append({"name": "@startDate", "value": start_date})
             parameters.append({"name": "@endDate", "value": end_date})
 
+        # Sort by date descending
         query += " ORDER BY c.date DESC"
 
         all_items = list(attendance_container.query_items(
@@ -983,6 +998,7 @@ async def get_all_attendance(req: func.HttpRequest) -> func.HttpResponse:
 
 
 
+
 # Helper function to upsert data into Cosmos DB
 def upsert_document(data: dict):
     try:
@@ -1005,92 +1021,76 @@ def upsert_document(data: dict):
 @require_auth
 async def search_employee(req: func.HttpRequest) -> func.HttpResponse:
     """
-    Search for employees by employeeId or name
-    
-    Query parameters:
-    - search: Search term (can be employeeId or partial name)
+    Search for employees by ID or name within a specific organization (based on sub in token).
+    Includes pagination support.
     """
-    # Log incoming request parameters for debugging
-    search = req.params.get('search')
-    logging.info(f"Received search parameter: {search}")
-
-    # Ensure that the search parameter is provided
-    if not search:
-        return func.HttpResponse(
-            body=json.dumps({
-                'warn': 'A search parameter is required'
-            }),
-            status_code=400,
-            mimetype="application/json"
-        )
+    logging.info(f"Token validated for user: {req.user_info.get('email', 'unknown')}")
 
     try:
-        # Initialize query conditions and parameters
-        query_conditions = []
-        parameters = []
-
-        # Determine search type and construct appropriate query
-        if search.isnumeric():
-            # Exact match for employeeId
-            query_conditions.append("c.employeeId = @employee_id")
-            parameters.append({"name": "@employee_id", "value": search})
-        else:
-            # Partial match for employeeName (case-insensitive)
-            # Use multiple conditions to search across different name fields
-            name_search_conditions = [
-                "CONTAINS(LOWER(c.employeeName), LOWER(@employee_name))",
-                "CONTAINS(LOWER(c.firstName), LOWER(@employee_name))",
-                "CONTAINS(LOWER(c.lastName), LOWER(@employee_name))"
-            ]
-            
-            # Combine name search conditions
-            query_conditions.append(f"({' OR '.join(name_search_conditions)})")
-            parameters.append({"name": "@employee_name", "value": search.strip().lower()})
-
-        # Construct the full query with selected fields
-        query = "SELECT c.employeeId, c.employeeName, c.role, c.email, c.dateOfJoining, c.imageUrl FROM c WHERE " + " OR ".join(query_conditions)
-
-        logging.info(f"Constructed query: {query}")
-
-        # Perform the query to Cosmos DB
-        items = list(employee_container.query_items(
-            query=query, 
-            parameters=parameters, 
-            enable_cross_partition_query=True
-        ))
-
-        # Handle query results
-        if items:
+        organization_id = req.user_info.get("sub")
+        if not organization_id:
             return func.HttpResponse(
-                body=json.dumps(items),
-                status_code=200,
+                body=json.dumps({'error': 'Unauthorized. Missing organization ID.'}),
+                status_code=401,
                 mimetype="application/json"
             )
 
-        # If no items found, return a 404 response
+        search = req.params.get('search', '').strip()
+        if not search:
+            return func.HttpResponse(
+                body=json.dumps({'error': 'Missing search parameter'}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        # Pagination
+        page_number = int(req.params.get('page_number', 1))
+        page_size = int(req.params.get('page_size', 10))
+        offset = (page_number - 1) * page_size
+
+        # Build base query
+        query = (
+            "SELECT c.employeeId, c.employeeName, c.role, c.email, c.dateOfJoining, c.imageUrl "
+            "FROM c WHERE c.organizationId = @orgId"
+        )
+        parameters = [{"name": "@orgId", "value": organization_id}]
+
+        if search.isnumeric():
+            query += " AND c.employeeId = @searchId"
+            parameters.append({"name": "@searchId", "value": search})
+        else:
+            query += (
+                " AND (CONTAINS(LOWER(c.employeeName), LOWER(@search)) "
+                "OR CONTAINS(LOWER(c.firstName), LOWER(@search)) "
+                "OR CONTAINS(LOWER(c.lastName), LOWER(@search)))"
+            )
+            parameters.append({"name": "@search", "value": search.lower()})
+
+        logging.info(f"Employee search query: {query}")
+
+        items = list(employee_container.query_items(
+            query=query,
+            parameters=parameters,
+            enable_cross_partition_query=True
+        ))
+
+        paginated_items = items[offset:offset + page_size]
+
         return func.HttpResponse(
-            body=json.dumps([]),
+            body=json.dumps({
+                "page_number": page_number,
+                "page_size": page_size,
+                "total_records": len(items),
+                "employees": paginated_items
+            }),
             status_code=200,
             mimetype="application/json"
         )
 
-    except exceptions.CosmosHttpResponseError as e:
-        # Handle Cosmos DB specific errors
-        logging.error(f"Failed to search employee records: {str(e)}")
-        return func.HttpResponse(
-            body=json.dumps({
-                'warn': f'Failed to search employee records: {str(e)}'
-            }),
-            status_code=500,
-            mimetype="application/json"
-        )
     except Exception as e:
-        # Catch any unexpected errors
-        logging.error(f"Unexpected error in search_employee: {str(e)}")
+        logging.error(f"Error during employee search: {str(e)}")
         return func.HttpResponse(
-            body=json.dumps({
-                'warn': 'An unexpected error occurred during employee search'
-            }),
+            body=json.dumps({'error': 'Internal Server Error'}),
             status_code=500,
             mimetype="application/json"
         )
@@ -3433,7 +3433,7 @@ async def add_user(req: func.HttpRequest) -> func.HttpResponse:
                     logging.warning(f"Attempt {attempt + 1} failed to rollback database entry: {str(db_err)}")
                     if attempt == 2:
                         logging.error(f"Failed to rollback database entry after 3 attempts: {str(db_err)}")
-                pendulum.time.sleep(1)  # Wait between retries
+                time.sleep(1)  # Wait between retries
            
             if 'b2c_user_id' in locals():
                 try:
@@ -3460,73 +3460,82 @@ async def add_user(req: func.HttpRequest) -> func.HttpResponse:
 async def get_all_users(req: func.HttpRequest) -> func.HttpResponse:
     user_info = req.user_info
     organization_id = user_info['sub']
-    
+   
     try:
-        # Get pagination parameters from query string (default to page 1, limit 10)
-        page = int(req.params.get('page', 1))
-        limit = int(req.params.get('limit', 10))
-        
-        # Ensure valid pagination values
-        page = max(1, page)  # Minimum page is 1
-        offset = (page - 1) * limit
-        
         # Debug logging
-        logging.info(f"Fetching users for organization_id: {organization_id}, page: {page}, limit: {limit}")
-        
-        # Query to get users for the organization with pagination
-        query = "SELECT * FROM c WHERE c.organization_id = @org_id ORDER BY c._ts DESC OFFSET @offset LIMIT @limit"
-        
+        logging.info(f"Fetching users for organization_id: {organization_id}")
+       
+        # Get pagination parameters from query string
+        page_size = int(req.params.get('page_size', 10))  # Default to 10 if not provided
+        page_no = int(req.params.get('page_no', 1))       # Default to page 1 if not provided
+       
+        if page_size <= 0 or page_no <= 0:
+            return func.HttpResponse(
+                json.dumps({"detail": "page_size and page_no must be positive integers"}),
+                mimetype="application/json",
+                status_code=400
+            )
+       
+        # Calculate offset and limit for pagination
+        offset = (page_no - 1) * page_size
+        limit = page_size
+       
+        # Query to get users for the organization
+        query = "SELECT * FROM c WHERE c.organization_id = @org_id OFFSET @offset LIMIT @limit"
+       
         # Query parameters
         query_params = [
             {"name": "@org_id", "value": organization_id},
             {"name": "@offset", "value": offset},
             {"name": "@limit", "value": limit}
         ]
-        
+       
         # Query options with cross-partition query explicitly enabled
         query_options = {
             'enable_cross_partition_query': True
         }
-        
-        # Get total count query
-        count_query = "SELECT VALUE COUNT(1) FROM c WHERE c.organization_id = @org_id"
-        count_params = [{"name": "@org_id", "value": organization_id}]
-        
+       
         # Query users container
         try:
-            # Get paginated items
             items = list(users_container.query_items(
                 query=query,
                 parameters=query_params,
                 **query_options
             ))
-            
-            # Get total count
+           
+            # Debug logging
+            logging.info(f"Query returned {len(items)} items for page_no: {page_no}, page_size: {page_size}")
+           
+            # Get total count of users for the organization (for pagination metadata)
+            count_query = "SELECT VALUE COUNT(1) FROM c WHERE c.organization_id = @org_id"
+            count_params = [{"name": "@org_id", "value": organization_id}]
             total_count = list(users_container.query_items(
                 query=count_query,
                 parameters=count_params,
                 enable_cross_partition_query=True
             ))[0]
-            
-            # Debug logging
-            logging.info(f"Query returned {len(items)} items out of {total_count} total")
-            
-            # If no items on this page but there are users, log all users to understand why
-            if not items and total_count > 0:
+           
+            # If no items, log all users to understand why
+            if not items:
+                # Try a query without filtering to see all users
                 all_users = list(users_container.query_items(
                     query="SELECT * FROM c",
                     enable_cross_partition_query=True
                 ))
                 logging.info(f"Total users in container: {len(all_users)}")
+               
+                # Log details of all users
                 for user in all_users:
                     logging.info(f"User: {user.get('id')} - Org ID: {user.get('organization_id')}")
-            
+           
             # Process users to remove sensitive information
             users = []
             for user in items:
+                # Remove sensitive fields
                 if 'passwordHash' in user:
                     del user['passwordHash']
-                
+               
+                # Clean other sensitive fields if needed
                 clean_user = {
                     'id': user.get('id'),
                     'name': user.get('name'),
@@ -3534,50 +3543,46 @@ async def get_all_users(req: func.HttpRequest) -> func.HttpResponse:
                     'role': user.get('role'),
                     'created_at': user.get('created_at'),
                     'updated_at': user.get('updated_at', user.get('created_at')),
-                    'organization_id': user.get('organization_id')
+                    'organization_id': user.get('organization_id')  # Add this for debugging
                 }
+               
                 users.append(clean_user)
-                
+               
         except exceptions as e:
             logging.error(f"Cosmos DB Error: {str(e)}")
             return func.HttpResponse(
-                json.dumps({"warn": f"Database error: {str(e)}"}),
+                json.dumps({"detail": f"Database error: {str(e)}"}),
                 mimetype="application/json",
                 status_code=500
             )
-        
-        # Calculate pagination metadata
-        total_pages = (total_count + limit - 1) // limit  # Ceiling division
-        
-        # Prepare response with pagination info
+       
+        # Prepare response with pagination metadata
         response = {
             "data": {
                 "users": users,
-                "pagination": {
-                    "current_page": page,
-                    "per_page": limit,
-                    "total_items": total_count,
-                    "total_pages": total_pages,
-                    "has_next": page < total_pages,
-                    "has_previous": page > 1
-                },
-                "organization_id": organization_id
+                "count": len(users),
+                "total_count": total_count,
+                "page_no": page_no,
+                "page_size": page_size,
+                "total_pages": (total_count + page_size - 1) // page_size,  # Ceiling division
+                "organization_id": organization_id  # Add this for debugging
             }
         }
-        
+       
         return func.HttpResponse(
             json.dumps(response),
             mimetype="application/json",
             status_code=200
         )
-        
+       
     except Exception as e:
         logging.error(f"Error getting users: {str(e)}")
         return func.HttpResponse(
-            json.dumps({"warn": f"An error occurred while getting users: {str(e)}"}),
+            json.dumps({"detail": f"An error occurred while getting users: {str(e)}"}),
             mimetype="application/json",
             status_code=500
         )
+ 
    
 
 #    # Microsoft Graph API Endpoints
@@ -3762,6 +3767,7 @@ async def get_all_users(req: func.HttpRequest) -> func.HttpResponse:
     
 ALLOWED_IMAGE_FORMATS = (".jpg", ".jpeg", ".png")
 
+
 @app.function_name(name="add_employee")
 @app.route(route='employee', methods=[func.HttpMethod.POST])
 @require_auth
@@ -3790,11 +3796,28 @@ async def add_employee(req: func.HttpRequest) -> func.HttpResponse:
             )
 
         # Extract fields from the JSON data
-        employee_id = json_data.get('employeeId')
         name = json_data.get('employeeName')
         role = json_data.get('role')
         email = json_data.get('email')
         image_name = json_data.get('imageName')
+
+        # Generate employeeId from email and organization_id
+        email_prefix = email.split('@')[0]
+        org_suffix = ''.join(filter(str.isdigit, organization_id))[-4:].zfill(4)  # Ensure 4 digits
+
+        # Initial candidate employee ID
+        employee_id_candidate = f"{email_prefix}_{org_suffix}"
+        employee_id = employee_id_candidate
+
+        # Ensure uniqueness in Cosmos DB (in case multiple with same email prefix in the same org)
+        counter = 1
+        while True:
+            query = f"SELECT * FROM c WHERE c.organizationId = '{organization_id}' AND c.employeeId = '{employee_id}'"
+            existing = list(employee_container.query_items(query=query, enable_cross_partition_query=True))
+            if not existing:
+                break
+            employee_id = f"{employee_id_candidate}_{counter}"
+            counter += 1
 
         # Check if required fields are provided
         if not employee_id or not name or not role or not email:
@@ -4039,7 +4062,6 @@ async def add_employee(req: func.HttpRequest) -> func.HttpResponse:
             logging.error(f"Error creating B2C user: Status {b2c_response.status_code}")
             logging.error(f"Response: {b2c_response.text}")
             
-           
             # Return error since we're doing Azure first approach
             return func.HttpResponse(
                 body=json.dumps({
@@ -4652,11 +4674,18 @@ async def get_all_employees(req: func.HttpRequest) -> func.HttpResponse:
             enable_cross_partition_query=True
         ))
 
-        # Apply pagination
+        total_records = len(employees)
         paginated_items = employees[offset:offset + page_size]
 
+        response_body = {
+            "page_number": page_number,
+            "page_size": page_size,
+            "total_records": total_records,
+            "employees": paginated_items
+        }
+
         return func.HttpResponse(
-            body=json.dumps(paginated_items),
+            body=json.dumps(response_body),
             status_code=200,
             mimetype="application/json"
         )
@@ -4668,6 +4697,7 @@ async def get_all_employees(req: func.HttpRequest) -> func.HttpResponse:
             status_code=500,
             mimetype="application/json"
         )
+
 
 @app.function_name(name="checkUserExists")
 @app.route(route='api/checkUserExists', methods=[func.HttpMethod.GET])
@@ -4753,93 +4783,6 @@ def send_credentials_email(to_email: str, name: str, email: str, password: str):
         return False
 
 
-
-# # get all attendance
-# @app.function_name(name="get_all_attendance")
-# @app.route(route='attendance/all', methods=[func.HttpMethod.GET])
-# @require_auth
-# async def get_all_attendance(req: func.HttpRequest) -> func.HttpResponse:
-#     """
-#     Retrieve attendance records by organizationId with optional filtering by employeeId and date.
-#     Includes pagination and sorting by date (latest first).
-#     """
-#     logging.info(f"Token validated for user: {req.user_info.get('email', 'unknown')}")
-
-#     try:
-#         # Extract organizationId from user info (sub)
-#         user_info = req.user_info
-#         organization_id = user_info.get("sub")  # This should be the actual org ID
-
-#         if not organization_id:
-#             return func.HttpResponse(
-#                 body=json.dumps({'warn': 'Unauthorized. Missing organization ID.'}),
-#                 status_code=401,
-#                 mimetype="application/json"
-#             )
-
-#         # Pagination parameters
-#         page_number = int(req.params.get('page_number', 1))
-#         page_size = int(req.params.get('page_size', 10))
-#         offset = (page_number - 1) * page_size
-#         from_date = req.params.get('from_date')   # New: start of date range
-#         to_date = req.params.get('to_date')       # New: end of date range
-
-
-#         # Optional filters
-#         employee_id = req.params.get('employeeId')
-#         attendance_date = req.params.get('date')  # Format: YYYY-MM-DD
-
-#         # Base query with organization filter
-#         query = "SELECT * FROM c WHERE c.organizationId = @orgId"
-#         parameters = [{"name": "@orgId", "value": organization_id}]
-
-#         if employee_id:
-#             query += " AND c.employeeId = @employeeId"
-#             parameters.append({"name": "@employeeId", "value": employee_id})
-
-#         if attendance_date:
-#             query += " AND c.date = @attendanceDate"
-#             parameters.append({"name": "@attendanceDate", "value": attendance_date})
-
-#         if from_date:
-#             query += " AND c.date >= @fromDate"
-#             parameters.append({"name": "@fromDate", "value": from_date})
-
-#         if to_date:
-#             query += " AND c.date <= @toDate"
-#             parameters.append({"name": "@toDate", "value": to_date})
-    
-
-#         query += " ORDER BY c.date DESC"
-
-#         # Query Cosmos DB
-#         all_items = list(attendance_container.query_items(
-#             query=query,
-#             parameters=parameters,
-#             enable_cross_partition_query=True
-#         ))
-
-#         # Paginate results
-#         paginated_items = all_items[offset:offset + page_size]
-
-#         return func.HttpResponse(
-#             body=json.dumps({
-#                 "page_number": page_number,
-#                 "page_size": page_size,
-#                 "total_records": len(all_items),
-#                 "data": paginated_items
-#             }),
-#             status_code=200,
-#             mimetype="application/json"
-#         )
-
-#     except Exception as e:
-#         logging.error(f"Error fetching attendance records: {str(e)}")
-#         return func.HttpResponse(
-#             body=json.dumps({'warn': 'Internal Server Error'}),
-#             status_code=500,
-#             mimetype="application/json"
-#         )
 
 
 
