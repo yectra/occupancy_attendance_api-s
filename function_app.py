@@ -17,6 +17,7 @@ import numpy as np
 import pendulum
 import datetime
 from datetime import datetime,date,timedelta
+import isodate
 import requests
 import re
 from datetime import timedelta
@@ -58,7 +59,7 @@ ATTENDANCE_CONTAINER_NAME = os.getenv('ATTENDANCE_CONTAINER_NAME')
 ORGANIZATION_CONTAINER_NAME = os.getenv('ORGANIZATION_CONTAINER_NAME')
 SETUP_CONTAINER_NAME = os.getenv('SETUP_CONTAINER_NAME')
 CAMERA_URLS_CONTAINER_NAME = os.getenv('CAMERA_URLS_CONTAINER_NAME')
-
+CAMERA_STATUS_CONTAINER_NAME=os.getenv('CAMERA_STATUS_CONTAINER_NAME')
 # Azure Blob Storage configuration
 BLOB_CONNECTION_STRING = os.getenv('STORAGE_CONNECTION_STRING')
 BLOB_CONTAINER_NAME = os.getenv('STORAGE_CONTAINER_NAME')
@@ -99,7 +100,7 @@ camera_urls_container = database.get_container_client(CAMERA_URLS_CONTAINER_NAME
 organization_container_name = database.get_container_client(ORGANIZATION_CONTAINER_NAME)
 setup_container = database.get_container_client(SETUP_CONTAINER_NAME)
   # Define attendance_container
-
+camera_status_container = database.get_container_client(CAMERA_STATUS_CONTAINER_NAME)
 setup_container_name = database.get_container_client(SETUP_CONTAINER_NAME)
 counts_container = database.get_container_client(COUNTS_CONTAINER)
 person_features =database.get_container_client(PERSON_FEATURE_CONTAINER)
@@ -3413,8 +3414,6 @@ async def add_user(req: func.HttpRequest) -> func.HttpResponse:
                 json.dumps({
                     "data": {
                         "user_id": user_id,
-                        "azure_b2c_id": b2c_user_id,
-                        "credentials": {"email": email, "password": password},
                         "message": "User added successfully to database and Azure AD B2C, email sent successfully"
                     }
                 }),
@@ -4186,14 +4185,6 @@ async def add_employee(req: func.HttpRequest) -> func.HttpResponse:
         return func.HttpResponse(
             body=json.dumps({
                 'message': 'Employee added successfully to Azure AD B2C and database',
-                'data': {
-                    'employee': employee_record,
-                    'azure_b2c_id': b2c_user_id,
-                    'credentials': {
-                        'email': email,
-                        'password': password
-                    }
-                }
             }),
             status_code=201,
             mimetype="application/json"
@@ -4783,6 +4774,132 @@ def send_credentials_email(to_email: str, name: str, email: str, password: str):
         return False
 
 
+
+
+ 
+@app.function_name(name="getAllCameraStatus")
+@app.route(route='api/getAllCameraStatus', methods=[func.HttpMethod.GET])
+@require_auth
+async def get_failed_camera_status(req: func.HttpRequest) -> func.HttpResponse:
+    user_info = req.user_info
+    organization_id = user_info['sub']
+   
+    try:
+        # Debug logging
+        logging.info(f"Fetching failed camera statuses for organization_id: {organization_id}")
+       
+        # Query to get only failed camera statuses for the organization
+        query = "SELECT * FROM c WHERE c.user_id = @org_id AND c.status = 'failed'"
+       
+        # Query parameters
+        query_params = [
+            {"name": "@org_id", "value": organization_id}
+        ]
+       
+        # Query options with cross-partition query explicitly enabled
+        query_options = {
+            'enable_cross_partition_query': True
+        }
+       
+        # Query camera_status container
+        try:
+            items = list(camera_status_container.query_items(
+                query=query,
+                parameters=query_params,
+                **query_options
+            ))
+           
+            # Debug logging
+            logging.info(f"Query returned {len(items)} failed camera statuses")
+           
+            # Get total count of failed camera statuses for the organization
+            count_query = "SELECT VALUE COUNT(1) FROM c WHERE c.user_id = @org_id AND c.status = 'failed'"
+            count_params = [{"name": "@org_id", "value": organization_id}]
+            total_count = list(camera_status_container.query_items(
+                query=count_query,
+                parameters=count_params,
+                enable_cross_partition_query=True
+            ))[0]
+           
+            # If no items, log all failed camera statuses to understand why
+            if not items:
+                # Try a query to see all failed camera statuses
+                all_statuses = list(camera_status_container.query_items(
+                    query="SELECT * FROM c WHERE c.status = 'failed'",
+                    enable_cross_partition_query=True
+                ))
+                logging.info(f"Total failed camera statuses in container: {len(all_statuses)}")
+               
+                # Log details of all failed camera statuses
+                for status in all_statuses:
+                    logging.info(f"Failed Camera Status: {status.get('id')} - User ID: {status.get('user_id')}")
+           
+            # Process failed camera statuses to remove sensitive information and format timestamp
+            camera_statuses = []
+            for status in items:
+                # Convert timestamp to separate date and time fields
+                timestamp = status.get('timestamp')
+                try:
+                    # Handle ISO format timestamp
+                    if isinstance(timestamp, str):
+                        dt = isodate.parse_datetime(timestamp)
+                        readable_date = dt.strftime("%Y-%m-%d")
+                        readable_time = dt.strftime("%H:%M:%S")
+                    # Handle Unix timestamp
+                    elif isinstance(timestamp, (int, float)):
+                        dt = datetime.fromtimestamp(timestamp)
+                        readable_date = dt.strftime("%Y-%m-%d")
+                        readable_time = dt.strftime("%H:%M:%S")
+                    else:
+                        readable_date = timestamp  # Fallback if format unknown
+                        readable_time = timestamp
+                except Exception as e:
+                    logging.warning(f"Error parsing timestamp {timestamp}: {str(e)}")
+                    readable_date = timestamp  # Use raw timestamp if parsing fails
+                    readable_time = timestamp
+               
+                # Clean sensitive fields and include formatted date and time
+                clean_status = {
+                    'id': status.get('id'),
+                    'user_id': status.get('user_id'),
+                    'camera_id': status.get('camera_id'),
+                    'videoUrl': status.get('videoUrl'),
+                    'status': status.get('status'),
+                    'date': readable_date,
+                    'time': readable_time
+                }
+               
+                camera_statuses.append(clean_status)
+               
+        except exceptions.CosmosHttpResponseError as e:
+            logging.error(f"Cosmos DB Error: {str(e)}")
+            return func.HttpResponse(
+                json.dumps({"detail": f"Database error: {str(e)}"}),
+                mimetype="application/json",
+                status_code=500
+            )
+       
+        # Prepare response
+        response = {
+            "data": {
+                "camera_statuses": camera_statuses,
+                "total_count": total_count
+            }
+        }
+       
+        return func.HttpResponse(
+            json.dumps(response),
+            mimetype="application/json",
+            status_code=200
+        )
+       
+    except Exception as e:
+        logging.error(f"Error getting failed camera statuses: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"detail": f"An error occurred while getting failed camera statuses: {str(e)}"}),
+            mimetype="application/json",
+            status_code=500
+        )
 
 
 

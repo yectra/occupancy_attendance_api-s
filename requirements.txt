@@ -10,6 +10,7 @@ numpy==1.26.3
 pendulum==2.1.2
 azure-identity==1.15.0
 sendgrid==6.10.0
+isodate==0.6.1
 
 
 
