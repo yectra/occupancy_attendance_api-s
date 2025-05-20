@@ -3967,7 +3967,7 @@ async def add_employee(req: func.HttpRequest) -> func.HttpResponse:
             user_data = check_user_response.json()
             if user_data.get("value"):
                 return func.HttpResponse(
-                    body=json.dumps({'error': f'Email {email} already exists in Azure AD B2C'}),
+                    body=json.dumps({'warn': f'Email {email} already exists in Azure AD B2C'}),
                     status_code=409,
                     mimetype="application/json"
                 )
@@ -4775,8 +4775,6 @@ def send_credentials_email(to_email: str, name: str, email: str, password: str):
 
 
 
-
- 
 @app.function_name(name="getAllCameraStatus")
 @app.route(route='api/getAllCameraStatus', methods=[func.HttpMethod.GET])
 @require_auth
@@ -4788,18 +4786,15 @@ async def get_failed_camera_status(req: func.HttpRequest) -> func.HttpResponse:
         # Debug logging
         logging.info(f"Fetching failed camera statuses for organization_id: {organization_id}")
        
+        # Initialize containers
+        users_container = database.get_container_client("users")
+        setup_container = database.get_container_client("setup-details")
+        user_counts_container = database.get_container_client("user_counts")
+       
         # Query to get only failed camera statuses for the organization
         query = "SELECT * FROM c WHERE c.user_id = @org_id AND c.status = 'failed'"
-       
-        # Query parameters
-        query_params = [
-            {"name": "@org_id", "value": organization_id}
-        ]
-       
-        # Query options with cross-partition query explicitly enabled
-        query_options = {
-            'enable_cross_partition_query': True
-        }
+        query_params = [{"name": "@org_id", "value": organization_id}]
+        query_options = {'enable_cross_partition_query': True}
        
         # Query camera_status container
         try:
@@ -4812,7 +4807,7 @@ async def get_failed_camera_status(req: func.HttpRequest) -> func.HttpResponse:
             # Debug logging
             logging.info(f"Query returned {len(items)} failed camera statuses")
            
-            # Get total count of failed camera statuses for the organization
+            # Get total count of failed camera statuses
             count_query = "SELECT VALUE COUNT(1) FROM c WHERE c.user_id = @org_id AND c.status = 'failed'"
             count_params = [{"name": "@org_id", "value": organization_id}]
             total_count = list(camera_status_container.query_items(
@@ -4821,44 +4816,37 @@ async def get_failed_camera_status(req: func.HttpRequest) -> func.HttpResponse:
                 enable_cross_partition_query=True
             ))[0]
            
-            # If no items, log all failed camera statuses to understand why
+            # If no items, log all failed camera statuses
             if not items:
-                # Try a query to see all failed camera statuses
                 all_statuses = list(camera_status_container.query_items(
                     query="SELECT * FROM c WHERE c.status = 'failed'",
                     enable_cross_partition_query=True
                 ))
                 logging.info(f"Total failed camera statuses in container: {len(all_statuses)}")
-               
-                # Log details of all failed camera statuses
                 for status in all_statuses:
                     logging.info(f"Failed Camera Status: {status.get('id')} - User ID: {status.get('user_id')}")
            
-            # Process failed camera statuses to remove sensitive information and format timestamp
+            # Process failed camera statuses
             camera_statuses = []
             for status in items:
-                # Convert timestamp to separate date and time fields
                 timestamp = status.get('timestamp')
                 try:
-                    # Handle ISO format timestamp
                     if isinstance(timestamp, str):
                         dt = isodate.parse_datetime(timestamp)
                         readable_date = dt.strftime("%Y-%m-%d")
                         readable_time = dt.strftime("%H:%M:%S")
-                    # Handle Unix timestamp
                     elif isinstance(timestamp, (int, float)):
                         dt = datetime.fromtimestamp(timestamp)
                         readable_date = dt.strftime("%Y-%m-%d")
                         readable_time = dt.strftime("%H:%M:%S")
                     else:
-                        readable_date = timestamp  # Fallback if format unknown
+                        readable_date = timestamp
                         readable_time = timestamp
                 except Exception as e:
                     logging.warning(f"Error parsing timestamp {timestamp}: {str(e)}")
-                    readable_date = timestamp  # Use raw timestamp if parsing fails
+                    readable_date = timestamp
                     readable_time = timestamp
                
-                # Clean sensitive fields and include formatted date and time
                 clean_status = {
                     'id': status.get('id'),
                     'user_id': status.get('user_id'),
@@ -4868,11 +4856,67 @@ async def get_failed_camera_status(req: func.HttpRequest) -> func.HttpResponse:
                     'date': readable_date,
                     'time': readable_time
                 }
-               
                 camera_statuses.append(clean_status)
-               
-        except exceptions.CosmosHttpResponseError as e:
-            logging.error(f"Cosmos DB Error: {str(e)}")
+           
+            # Get organization_id from users container
+            user_query = "SELECT c.organization_id FROM c WHERE c.azure_b2c_id = @user_id"
+            user_params = [{"name": "@user_id", "value": organization_id}]
+            user_items = list(users_container.query_items(
+                query=user_query,
+                parameters=user_params,
+                enable_cross_partition_query=True
+            ))
+            org_id = user_items[0]['organization_id'] if user_items and 'organization_id' in user_items[0] else organization_id
+           
+            # Get capacity from setup container
+            capacity_query = "SELECT c.capacityOfPeople FROM c WHERE c.organization_id = @organization_id"
+            parameters = [{"name": "@organization_id", "value": org_id}]
+            setup_items = list(setup_container.query_items(
+                query=capacity_query,
+                parameters=parameters,
+                enable_cross_partition_query=True
+            ))
+            capacity = setup_items[0].get("capacityOfPeople", 0) if setup_items else 0
+           
+            # Get counts from user_counts container
+            counts_query = "SELECT c.cameras FROM c WHERE c.user_id = @organization_id"
+            count_items = list(user_counts_container.query_items(
+                query=counts_query,
+                parameters=parameters,
+                enable_cross_partition_query=True
+            ))
+           
+            # Calculate total current count
+            total_current_count = 0
+            if count_items:
+                cameras_data = count_items[0].get("cameras", {})
+                for camera_id, camera_data in cameras_data.items():
+                    entry = camera_data.get("entry_count", 0)
+                    exit = camera_data.get("exit_count", 0)
+                    total_current_count += entry - exit
+           
+            # Calculate occupancy percentage
+            occupancy_percentage = (total_current_count / capacity * 100) if capacity > 0 else 0
+           
+            # Get alertMessage from setupdetail container
+            alert_query = "SELECT c.alertMessage FROM c WHERE c.organization_id = @organization_id"
+            alert_items = list(setup_container.query_items(
+                query=alert_query,
+                parameters=parameters,
+                enable_cross_partition_query=True
+            ))
+            try:
+                alert_message_str = alert_items[0].get("alertMessage", "0") if alert_items else "0"
+                alert_message = int(alert_message_str.replace('%', '')) if alert_message_str else 0
+            except ValueError as e:
+                logging.error(f"Failed to convert alertMessage '{alert_message_str}' to integer: {str(e)}")
+                alert_message = 0
+ 
+            # Determine alert flag
+            alert_flag = occupancy_percentage >= alert_message
+           
+        except Exception as e:
+            logging.error(f"Cosmos DB Error: {type(e).__name__}: {str(e)}")
             return func.HttpResponse(
                 json.dumps({"detail": f"Database error: {str(e)}"}),
                 mimetype="application/json",
@@ -4883,7 +4927,12 @@ async def get_failed_camera_status(req: func.HttpRequest) -> func.HttpResponse:
         response = {
             "data": {
                 "camera_statuses": camera_statuses,
-                "total_count": total_count
+                "total_count": total_count,
+                "alert": alert_flag,
+                "capacity": capacity,
+                "alert_message": alert_message,
+                "total_current_count": total_current_count,
+                "occupancy_percentage": occupancy_percentage
             }
         }
        
@@ -4894,7 +4943,7 @@ async def get_failed_camera_status(req: func.HttpRequest) -> func.HttpResponse:
         )
        
     except Exception as e:
-        logging.error(f"Error getting failed camera statuses: {str(e)}")
+        logging.error(f"Error getting failed camera statuses: {type(e).__name__}: {str(e)}")
         return func.HttpResponse(
             json.dumps({"detail": f"An error occurred while getting failed camera statuses: {str(e)}"}),
             mimetype="application/json",
@@ -4903,3 +4952,169 @@ async def get_failed_camera_status(req: func.HttpRequest) -> func.HttpResponse:
 
 
 
+@app.function_name(name="editPersonCountByDate")
+@app.route(route='api/editPersonCountByDate', methods=[func.HttpMethod.PUT])
+@require_auth
+async def edit_person_count_by_date(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        # Get user info and ID
+        user_info = req.user_info
+        user_id = user_info['sub']
+       
+        # Initialize containers
+        users_container = database.get_container_client(USERS)
+        user_logs_container = database.get_container_client(USER_LOGS)
+       
+        # Get request body
+        try:
+            req_body = req.get_json()
+        except ValueError:
+            return func.HttpResponse(
+                json.dumps({"error": "Invalid JSON in request body"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+       
+        # Validate required parameters
+        date_param = req_body.get('date')
+        camera_id = req_body.get('camera_id')
+        new_entries = req_body.get('entries')
+        new_exits = req_body.get('exits')
+       
+        if not all([date_param, camera_id, new_entries is not None, new_exits is not None]):
+            return func.HttpResponse(
+                json.dumps({"error": "Missing required parameters: date, camera_id, entries, and exits"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+       
+        # Validate date format
+        try:
+            selected_date = pendulum.parse(date_param).format('YYYY-MM-DD')
+        except Exception as e:
+            return func.HttpResponse(
+                json.dumps({"error": f"Invalid date format. Please use YYYY-MM-DD. Details: {str(e)}"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+       
+        # Validate count values
+        try:
+            new_entries = int(new_entries)
+            new_exits = int(new_exits)
+            if new_entries < 0 or new_exits < 0:
+                return func.HttpResponse(
+                    json.dumps({"error": "Entries and exits must be non-negative integers"}),
+                    status_code=400,
+                    mimetype="application/json"
+                )
+        except (ValueError, TypeError):
+            return func.HttpResponse(
+                json.dumps({"error": "Entries and exits must be valid integers"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+       
+        # Get organization_id from users container
+        user_query = "SELECT c.organization_id FROM c WHERE c.azure_b2c_id = @user_id"
+        user_params = [{"name": "@user_id", "value": user_id}]
+       
+        user_items = list(users_container.query_items(
+            query=user_query,
+            parameters=user_params,
+            enable_cross_partition_query=True
+        ))
+       
+        organization_id = user_items[0]['organization_id'] if user_items and 'organization_id' in user_items[0] else user_id
+       
+        # Query existing logs for the organization
+        logs_query = """
+        SELECT * FROM c
+        WHERE c.user_id = @organization_id
+        """
+        parameters = [{"name": "@organization_id", "value": organization_id}]
+       
+        logs_items = list(user_logs_container.query_items(
+            query=logs_query,
+            parameters=parameters,
+            enable_cross_partition_query=True
+        ))
+       
+        # Prepare the updated document
+        if logs_items:
+            # Existing document found
+            doc = logs_items[0]
+            logs = doc.get("logs", [])
+            editable_counts = doc.get("editable_counts", [])
+        else:
+            # Create new document
+            doc = {
+                "id": organization_id,
+                "user_id": organization_id,
+                "logs": [],
+                "editable_counts": []
+            }
+            logs = []
+            editable_counts = []
+       
+        # Check if there's an existing editable count for this date and camera
+        existing_count_index = next(
+            (i for i, count in enumerate(editable_counts)
+             if count.get("date") == selected_date and count.get("camera_id") == camera_id),
+            None
+        )
+       
+        # Prepare the new editable count entry
+        new_count_entry = {
+            "date": selected_date,
+            "camera_id": camera_id,
+            "entries": new_entries,
+            "exits": new_exits,
+            "net_count": new_entries - new_exits,
+            "updated_at": pendulum.now().to_iso8601_string()
+        }
+       
+        # Update or append the editable count
+        if existing_count_index is not None:
+            editable_counts[existing_count_index] = new_count_entry
+        else:
+            editable_counts.append(new_count_entry)
+       
+        # Update the document with new editable counts
+        doc["editable_counts"] = editable_counts
+       
+        # Upsert the document
+        user_logs_container.upsert_item(doc)
+       
+        # Prepare response
+        response_data = {
+            "data": {
+                "date": selected_date,
+                "camera_id": camera_id,
+                "entries": new_entries,
+                "exits": new_exits,
+                "net_count": new_entries - new_exits,
+                "updated_at": new_count_entry["updated_at"]
+            }
+        }
+       
+        return func.HttpResponse(
+            json.dumps(response_data),
+            status_code=200,
+            mimetype="application/json"
+        )
+   
+    except exceptions.CosmosHttpResponseError as e:
+        logging.error(f"Cosmos DB error in putPersonCountByDate: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"error": f"Database error: {str(e)}"}),
+            status_code=500,
+            mimetype="application/json"
+        )
+    except Exception as e:
+        logging.error(f"Unexpected error in putPersonCountByDate: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"error": f"An unexpected error occurred: {str(e)}"}),
+            status_code=500,
+            mimetype="application/json"
+        )
