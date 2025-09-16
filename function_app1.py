@@ -1375,3 +1375,91 @@ async def getAllCounts(req: func.HttpRequest) -> func.HttpResponse:
             status_code=500
         )
  
+ 
+
+ # # get all attendance
+# @app.function_name(name="get_all_attendance")
+# @app.route(route='attendance/all', methods=[func.HttpMethod.GET])
+# @require_auth
+# async def get_all_attendance(req: func.HttpRequest) -> func.HttpResponse:
+#     """
+#     Retrieve attendance records by organizationId with optional filtering by employeeId and date.
+#     Includes pagination and sorting by date (latest first).
+#     """
+#     logging.info(f"Token validated for user: {req.user_info.get('email', 'unknown')}")
+
+#     try:
+#         # Extract organizationId from user info (sub)
+#         user_info = req.user_info
+#         organization_id = user_info.get("sub")  # This should be the actual org ID
+
+#         if not organization_id:
+#             return func.HttpResponse(
+#                 body=json.dumps({'warn': 'Unauthorized. Missing organization ID.'}),
+#                 status_code=401,
+#                 mimetype="application/json"
+#             )
+
+#         # Pagination parameters
+#         page_number = int(req.params.get('page_number', 1))
+#         page_size = int(req.params.get('page_size', 10))
+#         offset = (page_number - 1) * page_size
+#         from_date = req.params.get('from_date')   # New: start of date range
+#         to_date = req.params.get('to_date')       # New: end of date range
+
+
+#         # Optional filters
+#         employee_id = req.params.get('employeeId')
+#         attendance_date = req.params.get('date')  # Format: YYYY-MM-DD
+
+#         # Base query with organization filter
+#         query = "SELECT * FROM c WHERE c.organizationId = @orgId"
+#         parameters = [{"name": "@orgId", "value": organization_id}]
+
+#         if employee_id:
+#             query += " AND c.employeeId = @employeeId"
+#             parameters.append({"name": "@employeeId", "value": employee_id})
+
+#         if attendance_date:
+#             query += " AND c.date = @attendanceDate"
+#             parameters.append({"name": "@attendanceDate", "value": attendance_date})
+
+#         if from_date:
+#             query += " AND c.date >= @fromDate"
+#             parameters.append({"name": "@fromDate", "value": from_date})
+
+#         if to_date:
+#             query += " AND c.date <= @toDate"
+#             parameters.append({"name": "@toDate", "value": to_date})
+    
+
+#         query += " ORDER BY c.date DESC"
+
+#         # Query Cosmos DB
+#         all_items = list(attendance_container.query_items(
+#             query=query,
+#             parameters=parameters,
+#             enable_cross_partition_query=True
+#         ))
+
+#         # Paginate results
+#         paginated_items = all_items[offset:offset + page_size]
+
+#         return func.HttpResponse(
+#             body=json.dumps({
+#                 "page_number": page_number,
+#                 "page_size": page_size,
+#                 "total_records": len(all_items),
+#                 "data": paginated_items
+#             }),
+#             status_code=200,
+#             mimetype="application/json"
+#         )
+
+#     except Exception as e:
+#         logging.error(f"Error fetching attendance records: {str(e)}")
+#         return func.HttpResponse(
+#             body=json.dumps({'warn': 'Internal Server Error'}),
+#             status_code=500,
+#             mimetype="application/json"
+#         )

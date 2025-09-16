@@ -40,6 +40,7 @@ import urllib.parse
 from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail, From, To
 import time
+from azure.cosmos import ContainerProxy
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
 
 # Load environment variables from .env file
@@ -60,6 +61,7 @@ ORGANIZATION_CONTAINER_NAME = os.getenv('ORGANIZATION_CONTAINER_NAME')
 SETUP_CONTAINER_NAME = os.getenv('SETUP_CONTAINER_NAME')
 CAMERA_URLS_CONTAINER_NAME = os.getenv('CAMERA_URLS_CONTAINER_NAME')
 CAMERA_STATUS_CONTAINER_NAME=os.getenv('CAMERA_STATUS_CONTAINER_NAME')
+CAMERA_STATUS_CONTAINER_NAME_ATTENDANCE=os.getenv('CAMERA_STATUS_CONTAINER_NAME_ATTENDANCE')
 # Azure Blob Storage configuration
 BLOB_CONNECTION_STRING = os.getenv('STORAGE_CONNECTION_STRING')
 BLOB_CONTAINER_NAME = os.getenv('STORAGE_CONTAINER_NAME')
@@ -97,8 +99,10 @@ database = client.get_database_client(DATABASE_NAME)
 employee_container = database.get_container_client(EMPLOYEE_CONTAINER_NAME)
 attendance_container = database.get_container_client(ATTENDANCE_CONTAINER_NAME)
 camera_urls_container = database.get_container_client(CAMERA_URLS_CONTAINER_NAME)
-organization_container_name = database.get_container_client(ORGANIZATION_CONTAINER_NAME)
+organization_container_name = database.get_container_client(ORGANIZATION_CONTAINER_NAME) 
 setup_container = database.get_container_client(SETUP_CONTAINER_NAME)
+camera_status_container_attendance=database.get_container_client(CAMERA_STATUS_CONTAINER_NAME_ATTENDANCE)
+ 
   # Define attendance_container
 camera_status_container = database.get_container_client(CAMERA_STATUS_CONTAINER_NAME)
 setup_container_name = database.get_container_client(SETUP_CONTAINER_NAME)
@@ -1895,15 +1899,15 @@ async def get_person_detection_over_time(req: func.HttpRequest) -> func.HttpResp
         capacity = setup_items[0].get("capacityOfPeople", 0)
         if capacity == 0:
             return func.HttpResponse(
-                json.dumps({"warn": "Capacity not set or is zero"}),
+                json.dumps({"error": "Capacity not set or is zero"}),
                 status_code=400
             )
  
-        # Query to get person logs from user_logs table using organization_id
+        # Query to get person logs and manual adjustments from user_logs table using organization_id
         logs_query = """
-        SELECT c.logs
+        SELECT c.logs, c.manual_adjustments
         FROM c
-        WHERE c.user_id= @organization_id
+        WHERE c.user_id = @organization_id
         """
        
         logs_items = list(user_logs_container.query_items(
@@ -1912,7 +1916,7 @@ async def get_person_detection_over_time(req: func.HttpRequest) -> func.HttpResp
             enable_cross_partition_query=True
         ))
  
-        if not logs_items or "logs" not in logs_items[0]:
+        if not logs_items or ("logs" not in logs_items[0] and "manual_adjustments" not in logs_items[0]):
             return func.HttpResponse(
                 json.dumps({"data": []}),
                 status_code=200
@@ -1921,6 +1925,8 @@ async def get_person_detection_over_time(req: func.HttpRequest) -> func.HttpResp
         # Dictionary to count entries and exits per hour per camera
         entry_counts_by_hour = defaultdict(lambda: defaultdict(int))
         exit_counts_by_hour = defaultdict(lambda: defaultdict(int))
+        # Dictionary to aggregate manual adjustments by date
+        manual_adjustments_by_date = defaultdict(lambda: {"entries": 0, "exits": 0})
        
         # Process logs and group by hour
         logs = logs_items[0].get("logs", [])
@@ -1944,50 +1950,112 @@ async def get_person_detection_over_time(req: func.HttpRequest) -> func.HttpResp
                     logging.warning(f"Failed to parse timestamp {timestamp}: {str(parse_error)}")
                     continue
  
-        # Get a set of all hour keys from both entries and exits
+        # Process manual adjustments and group by date
+        manual_adjustments = logs_items[0].get("manual_adjustments", [])
+        manual_adjustment_dates = set()
+        for adjustment in manual_adjustments:
+            date = adjustment.get("date")
+            entries = adjustment.get("entries", 0)
+            exits = adjustment.get("exits", 0)
+            if date:
+                try:
+                    # Validate date format
+                    pendulum.from_format(date, 'YYYY-MM-DD')
+                    manual_adjustments_by_date[date]["entries"] += entries
+                    manual_adjustments_by_date[date]["exits"] += exits
+                    manual_adjustment_dates.add(date)
+                except Exception as parse_error:
+                    logging.warning(f"Failed to parse manual adjustment date {date}: {str(parse_error)}")
+                    continue
+ 
+        # Get all hour keys from camera logs
         all_hour_keys = set(entry_counts_by_hour.keys()) | set(exit_counts_by_hour.keys())
        
-        # Create time series data with hourly counts and percentages
-        time_series_data = []
+        # Create time series data dictionary by date and hour
+        time_series_by_date_hour = {}
        
-        for hour_key in sorted(all_hour_keys):
-            camera_counts = {}
-            total_entries = 0
-            total_exits = 0
-           
-            # Get all camera IDs for this hour
-            all_cameras = set(entry_counts_by_hour[hour_key].keys()) | set(exit_counts_by_hour[hour_key].keys())
-           
-            # Calculate net count for each camera
-            for camera_id in all_cameras:
-                entries = entry_counts_by_hour[hour_key][camera_id]
-                exits = exit_counts_by_hour[hour_key][camera_id]
-                net_count = entries - exits
-               
-                camera_counts[camera_id] = net_count
-                total_entries += entries
-                total_exits += exits
-           
-            total_count = total_entries - total_exits
-            percentage = (total_count / capacity * 100) if capacity > 0 else 0
-           
-            # Parse the hour key and create hour range
+        # Process camera logs
+        for hour_key in all_hour_keys:
             try:
                 dt = pendulum.from_format(hour_key, 'YYYY-MM-DD HH')
-                next_hour = dt.add(hours=1)
+                date_key = dt.format('YYYY-MM-DD')
+                camera_counts = {}
+                total_entries = 0
+                total_exits = 0
                
+                # Get all camera IDs for this hour
+                all_cameras = set(entry_counts_by_hour[hour_key].keys()) | set(exit_counts_by_hour[hour_key].keys())
+               
+                # Calculate net count for each camera
+                for camera_id in all_cameras:
+                    entries = entry_counts_by_hour[hour_key][camera_id]
+                    exits = exit_counts_by_hour[hour_key][camera_id]
+                    net_count = entries - exits
+                   
+                    camera_counts[camera_id] = net_count
+                    total_entries += entries
+                    total_exits += exits
+               
+                total_count = total_entries - total_exits
+               
+                # Create hour range
+                next_hour = dt.add(hours=1)
                 hour_range = f"{dt.format('h:mm A')} - {next_hour.format('h:mm A')}"
                
-                time_series_data.append({
-                    "date": dt.format('YYYY-MM-DD'),
+                time_series_by_date_hour[(date_key, hour_range)] = {
+                    "date": date_key,
                     "hour_range": hour_range,
                     "total_person_count": total_count,
                     "camera_counts": camera_counts,
-                    "percentage": round(percentage, 2)
-                })
+                    "percentage": 0  # Will be updated after adding manual adjustments
+                }
             except Exception as format_error:
                 logging.error(f"Failed to format hour_key {hour_key}: {str(format_error)}")
                 continue
+ 
+        # Add manual adjustments to existing entries or create new ones
+        for date in manual_adjustment_dates:
+            try:
+                dt = pendulum.from_format(date, 'YYYY-MM-DD')
+                # Use a default hour (e.g., 12 AM) for dates with only manual adjustments
+                default_hour = dt.start_of('day')
+                next_hour = default_hour.add(hours=1)
+                default_hour_range = f"{default_hour.format('h:mm A')} - {next_hour.format('h:mm A')}"
+               
+                # Check if this date has any camera logs
+                existing_hours = {hr for (d, hr) in time_series_by_date_hour.keys() if d == date}
+               
+                if existing_hours:
+                    # Add manual adjustments to all existing hours for this date
+                    for hour_range in existing_hours:
+                        if (date, hour_range) in time_series_by_date_hour:
+                            time_series_by_date_hour[(date, hour_range)]["total_person_count"] += (
+                                manual_adjustments_by_date[date]["entries"] -
+                                manual_adjustments_by_date[date]["exits"]
+                            )
+                else:
+                    # Create a new entry for this date with manual adjustments only
+                    time_series_by_date_hour[(date, default_hour_range)] = {
+                        "date": date,
+                        "hour_range": default_hour_range,
+                        "total_person_count": (
+                            manual_adjustments_by_date[date]["entries"] -
+                            manual_adjustments_by_date[date]["exits"]
+                        ),
+                        "camera_counts": {},
+                        "percentage": 0
+                    }
+            except Exception as format_error:
+                logging.error(f"Failed to process manual adjustment date {date}: {str(format_error)}")
+                continue
+ 
+        # Calculate percentages and prepare final time series data
+        time_series_data = []
+        for entry in time_series_by_date_hour.values():
+            total_count = entry["total_person_count"]
+            percentage = (total_count / capacity * 100) if capacity > 0 else 0
+            entry["percentage"] = round(percentage, 2)
+            time_series_data.append(entry)
  
         # Sort data by datetime
         time_series_data.sort(key=lambda x: pendulum.from_format(
@@ -2006,125 +2074,125 @@ async def get_person_detection_over_time(req: func.HttpRequest) -> func.HttpResp
     except Exception as e:
         logging.error(f"Unexpected error: {str(e)}")
         return func.HttpResponse(
-            json.dumps({"warn": "An unexpected error occurred."}),
+            json.dumps({"detail": "An unexpected error occurred."}),
             status_code=500
         )
+   
  
 
 @app.function_name(name="getAllCounts")
 @app.route(route='api/getAllCounts', methods=[func.HttpMethod.GET])
 @require_auth
-async def getAllCounts(req: func.HttpRequest) -> func.HttpResponse:
+async def get_all_counts(req: func.HttpRequest) -> func.HttpResponse:
     user_info = req.user_info
+    if not user_info or 'sub' not in user_info:
+        logging.error("Missing or invalid user_info in request")
+        return func.HttpResponse(
+            json.dumps({"status": "error", "detail": "Unauthorized: Missing user information"}),
+            mimetype="application/json",
+            status_code=401
+        )
+ 
     user_id = user_info['sub']
-   
-    # Initialize containers
-    users_container = database.get_container_client(USERS)
-   
+    logging.info(f"Fetching counts for user_id: {user_id}")
+ 
     try:
-        # First check users container for organization_id
+        # Get organization_id
         user_query = "SELECT c.organization_id FROM c WHERE c.azure_b2c_id = @user_id"
         user_params = [{"name": "@user_id", "value": user_id}]
-       
         user_items = list(users_container.query_items(
             query=user_query,
             parameters=user_params,
             enable_cross_partition_query=True
         ))
-       
-        # Determine organization_id to use
-        if user_items and len(user_items) > 0 and 'organization_id' in user_items[0]:
-            organization_id = user_items[0]['organization_id']
-        else:
-            # Fallback to using sub directly as organization_id
-            organization_id = user_id
+        organization_id = user_items[0]['organization_id'] if user_items and 'organization_id' in user_items[0] else user_id
  
-        # Query to get capacity from setup container using organization_id
-        capacity_query = """
-        SELECT c.capacityOfPeople
-        FROM c
-        WHERE c.organization_id = @organization_id
-        """
-        parameters = [{"name": "@organization_id", "value": organization_id}]
-       
-        setup_items = list(setup_container.query_items(
-            query=capacity_query,
-            parameters=parameters,
-            enable_cross_partition_query=True
-        ))
-       
-        capacity = setup_items[0].get("capacityOfPeople", 0) if setup_items else 0
-       
-        # Query to get counts from user_counts table using organization_id
-        counts_query = """
-        SELECT c.cameras, c.last_updated
-        FROM c
-        WHERE c.user_id = @organization_id
-        """
-       
+        # Query counts
+        counts_query = "SELECT c.cameras, c.last_updated FROM c WHERE c.user_id = @org_id"
+        parameters = [{"name": "@org_id", "value": organization_id}]
         count_items = list(user_counts_container.query_items(
             query=counts_query,
             parameters=parameters,
             enable_cross_partition_query=True
         ))
-       
-        if not count_items and not setup_items:
-            return func.HttpResponse(
-                json.dumps({
-                    "camera_counts": {},
-                    "total": {
-                        "current_count": 0,
-                        "percentage": 0
-                    }
-                }),
-                status_code=200
-            )
-       
-        # Calculate counts for each camera
+ 
+        # Query manual adjustments
+        logs_query = "SELECT c.manual_adjustments FROM c WHERE c.user_id = @org_id"
+        logs_items = list(user_logs_container.query_items(
+            query=logs_query,
+            parameters=parameters,
+            enable_cross_partition_query=True
+        ))
+ 
+        # Initialize response data
         camera_counts = {}
         total_current_count = 0
-       
+        total_manual_entries = 0
+        total_manual_exits = 0
+ 
+        # Process camera counts
         if count_items:
             cameras_data = count_items[0].get("cameras", {})
-           
             for camera_id, camera_data in cameras_data.items():
                 entry = camera_data.get("entry_count", 0)
                 exit = camera_data.get("exit_count", 0)
                 current_count = entry - exit
-               
                 camera_counts[camera_id] = {
                     "entry": entry,
                     "exit": exit,
                     "current_count": current_count,
                     "last_updated": camera_data.get("timestamp", "")
                 }
-               
                 total_current_count += current_count
-       
-        # Calculate occupancy percentage
-        occupancy_percentage = (total_current_count / capacity * 100) if capacity > 0 else 0
-       
+ 
+        # Process manual adjustments
+        if logs_items and "manual_adjustments" in logs_items[0]:
+            manual_adjustments = logs_items[0].get("manual_adjustments", [])
+            for adjustment in manual_adjustments:
+                entries = adjustment.get("entries", 0)
+                exits = adjustment.get("exits", 0)
+                total_manual_entries += entries
+                total_manual_exits += exits
+                total_current_count += (entries - exits)
+ 
+        # Get alert info
+        alert_flag, capacity, alert_message, occupancy_percentage = get_alert_info(
+            organization_id, total_current_count, setup_container
+        )
+ 
+        # Prepare response
         response_data = {
-            "camera_counts": camera_counts,
-            "total": {
-                "current_count": total_current_count,
-                "percentage": round(occupancy_percentage, 2)
+            "data": {
+                "camera_counts": camera_counts,
+                "Manual Adjustments": {
+                    "entry": total_manual_entries,
+                    "exit": total_manual_exits,
+                    "current_count": total_manual_entries - total_manual_exits
+                },
+                "total": {
+                    "current_count": total_current_count,
+                    "percentage": occupancy_percentage,
+                    "alert": alert_flag,
+                    "capacity": capacity,
+                    "alert_message": alert_message
+                }
             }
         }
-       
+ 
         return func.HttpResponse(
             json.dumps(response_data),
-            status_code=200,
-            mimetype="application/json"
+            mimetype="application/json",
+            status_code=200
         )
-       
+ 
     except Exception as e:
-        logging.error(f"Unexpected error: {str(e)}")
+        logging.error(f"Unexpected error: {type(e).__name__}: {str(e)}")
         return func.HttpResponse(
-            json.dumps({"warn": "An unexpected error occurred."}),
+            json.dumps({"status": "error", "detail": "An unexpected error occurred."}),
+            mimetype="application/json",
             status_code=500
-        )  
-
+        )
+ 
 
 
 class CameraDetail(BaseModel):
@@ -2317,13 +2385,13 @@ async def get_person_count_by_date(req: func.HttpRequest) -> func.HttpResponse:
    
     # Initialize containers
     users_container = database.get_container_client(USERS)
-    user_logs_container = database.get_container_client(USER_LOGS)  # Ensure this is defined
+    user_logs_container = database.get_container_client(USER_LOGS)
    
     # Get date parameters from the request query string
     date_param = req.params.get('date')
     start_date_param = req.params.get('start_date')
     end_date_param = req.params.get('end_date')
-    period_param = req.params.get('period')  # New parameter for yesterday, week, month
+    period_param = req.params.get('period')
    
     # Determine if we're processing a single date, date range, or period
     if period_param in ['yesterday', 'week', 'month']:
@@ -2335,60 +2403,57 @@ async def get_person_count_by_date(req: func.HttpRequest) -> func.HttpResponse:
                 selected_date = start_date.format('YYYY-MM-DD')
                 mode = "single"
             elif period_param == 'week':
-                # Current week: from Monday to today (or end of week)
-                start_date = today.start_of('week')  # Monday of the current week
-                end_date = today.end_of('day')  # Up to today
-                # Alternative: end_date = today.end_of('week')  # Sunday of the current week
+                start_date = today.start_of('week')
+                end_date = today.end_of('day')
                 mode = "range"
                 selected_date = None
             elif period_param == 'month':
-                # Current month: from 1st of the month to today (or end of month)
-                start_date = today.start_of('month')  # 1st of the current month
-                end_date = today.end_of('day')  # Up to today
-                # Alternative: end_date = today.end_of('month')  # Last day of the month
+                start_date = today.start_of('month')
+                end_date = today.end_of('day')
                 mode = "range"
                 selected_date = None
         except Exception as e:
             return func.HttpResponse(
-                json.dumps({"warn": f"Invalid period parameter. Details: {str(e)}"}),
-                status_code=400
+                json.dumps({"error": f"Invalid period parameter. Details: {str(e)}"}),
+                status_code=400,
+                mimetype="application/json"
             )
     elif start_date_param and end_date_param:
-        # Validate and parse date range
         try:
             start_date = pendulum.parse(start_date_param).start_of('day')
             end_date = pendulum.parse(end_date_param).end_of('day')
             if start_date > end_date:
                 return func.HttpResponse(
                     json.dumps({"warn": "start_date cannot be after end_date"}),
-                    status_code=400
+                    status_code=400,
+                    mimetype="application/json"
                 )
             mode = "range"
             selected_date = None
         except Exception as e:
             return func.HttpResponse(
                 json.dumps({"warn": f"Invalid date format for start_date or end_date. Please use YYYY-MM-DD. Details: {str(e)}"}),
-                status_code=400
+                status_code=400,
+                mimetype="application/json"
             )
     else:
-        # Single date mode
         if date_param:
             try:
                 selected_date = pendulum.parse(date_param).format('YYYY-MM-DD')
             except Exception as e:
                 return func.HttpResponse(
                     json.dumps({"warn": f"Invalid date format. Please use YYYY-MM-DD. Details: {str(e)}"}),
-                    status_code=400
+                    status_code=400,
+                    mimetype="application/json"
                 )
         else:
-            # Default to current date
             selected_date = pendulum.now().format('YYYY-MM-DD')
         start_date = pendulum.parse(selected_date).start_of('day')
         end_date = pendulum.parse(selected_date).end_of('day')
         mode = "single"
    
     try:
-        # First check users container for organization_id
+        # Get organization_id from users container
         user_query = "SELECT c.organization_id FROM c WHERE c.azure_b2c_id = @user_id"
         user_params = [{"name": "@user_id", "value": user_id}]
        
@@ -2398,16 +2463,11 @@ async def get_person_count_by_date(req: func.HttpRequest) -> func.HttpResponse:
             enable_cross_partition_query=True
         ))
        
-        # Determine organization_id to use
-        if user_items and len(user_items) > 0 and 'organization_id' in user_items[0]:
-            organization_id = user_items[0]['organization_id']
-        else:
-            # Fallback to using sub directly as organization_id
-            organization_id = user_id
+        organization_id = user_items[0]['organization_id'] if user_items and 'organization_id' in user_items[0] else user_id
  
-        # Query to get person logs from user_logs table using organization_id
+        # Query to get logs and manual_adjustments from user_logs table
         logs_query = """
-        SELECT c.logs
+        SELECT c.logs, c.manual_adjustments
         FROM c
         WHERE c.user_id = @organization_id
         """
@@ -2419,62 +2479,70 @@ async def get_person_count_by_date(req: func.HttpRequest) -> func.HttpResponse:
             enable_cross_partition_query=True
         ))
  
-        if not logs_items or "logs" not in logs_items[0]:
-            # Return empty data with the simplified structure
-            response_data = {
-                "data": {
-                    "total_entries": 0,
-                    "total_exits": 0,
-                    "total_count": 0,
-                    "camera_data": []
-                }
-            }
-            if mode == "single":
-                response_data["data"]["date"] = selected_date
-            else:
-                response_data["data"]["date_range"] = {
-                    "start_date": start_date.format('YYYY-MM-DD'),
-                    "end_date": end_date.format('YYYY-MM-DD')
-                }
-            return func.HttpResponse(
-                json.dumps(response_data),
-                status_code=200,
-                mimetype="application/json"
-            )
- 
-        # Dictionary to count entries and exits per camera
+        # Initialize response data
+        log_entries = 0
+        log_exits = 0
+        manual_entries = 0
+        manual_exits = 0
         camera_entry_counts = defaultdict(int)
         camera_exit_counts = defaultdict(int)
         all_cameras = set()
-       
-        # Process logs and filter by date or date range
-        logs = logs_items[0].get("logs", [])
-        for log in logs:
-            timestamp = log.get("timestamp")
-            camera_id = log.get("camera_id")
-            event_type = log.get("event_type")
+        manual_adjustments_data = []
  
-            if timestamp and camera_id and event_type:
-                try:
-                    # Parse timestamp
-                    log_datetime = pendulum.parse(timestamp)
-                   
-                    # Check if the log falls within the date range
-                    if start_date <= log_datetime <= end_date:
-                        all_cameras.add(camera_id)
-                       
-                        if event_type == "person_entry":
-                            camera_entry_counts[camera_id] += 1
-                        elif event_type == "person_exit":
-                            camera_exit_counts[camera_id] += 1
-                except Exception as parse_error:
-                    logging.warning(f"Failed to parse timestamp {timestamp}: {str(parse_error)}")
-                    continue
+        if logs_items and "logs" in logs_items[0]:
+            # Process logs
+            logs = logs_items[0].get("logs", [])
+            for log in logs:
+                timestamp = log.get("timestamp")
+                camera_id = log.get("camera_id")
+                event_type = log.get("event_type")
+ 
+                if timestamp and camera_id and event_type:
+                    try:
+                        log_datetime = pendulum.parse(timestamp)
+                        if start_date <= log_datetime <= end_date:
+                            all_cameras.add(camera_id)
+                            if event_type == "person_entry":
+                                camera_entry_counts[camera_id] += 1
+                            elif event_type == "person_exit":
+                                camera_exit_counts[camera_id] += 1
+                    except Exception as parse_error:
+                        logging.warning(f"Failed to parse timestamp {timestamp}: {str(parse_error)}")
+                        continue
+           
+            # Calculate log-based totals
+            log_entries = sum(camera_entry_counts.values())
+            log_exits = sum(camera_exit_counts.values())
        
-        # Calculate totals
-        total_entries = sum(camera_entry_counts.values())
-        total_exits = sum(camera_exit_counts.values())
+        # Process manual_adjustments
+        if logs_items and "manual_adjustments" in logs_items[0]:
+            manual_adjustments = logs_items[0].get("manual_adjustments", [])
+            for adjustment in manual_adjustments:
+                adjustment_date = adjustment.get("date")
+                try:
+                    adjustment_datetime = pendulum.parse(adjustment_date).start_of('day')
+                    if start_date <= adjustment_datetime <= end_date:
+                        adjustment_entries = adjustment.get("entries", 0)
+                        adjustment_exits = adjustment.get("exits", 0)
+                        manual_entries += adjustment_entries
+                        manual_exits += adjustment_exits
+                        manual_adjustments_data.append({
+                            "date": adjustment_date,
+                            "updated_at": adjustment.get("updated_at", ""),
+                            "entries": adjustment_entries,
+                            "exits": adjustment_exits,
+                            "net_count": adjustment_entries - adjustment_exits
+                        })
+                except Exception as parse_error:
+                    logging.warning(f"Failed to parse manual adjustment date {adjustment_date}: {str(parse_error)}")
+                    continue
+ 
+        # Calculate combined totals
+        total_entries = log_entries + manual_entries
+        total_exits = log_exits + manual_exits
         total_count = total_entries - total_exits
+        log_net_count = log_entries - log_exits
+        manual_adjustments_net_count = manual_entries - manual_exits
        
         # Prepare camera-specific data
         camera_data = []
@@ -2482,24 +2550,33 @@ async def get_person_count_by_date(req: func.HttpRequest) -> func.HttpResponse:
             entries = camera_entry_counts[camera_id]
             exits = camera_exit_counts[camera_id]
             net_count = entries - exits
-           
             camera_data.append({
                 "camera_id": camera_id,
                 "entries": entries,
                 "exits": exits,
                 "net_count": net_count
             })
-           
-        # Sort camera data by camera_id for consistency
+       
+        # Sort camera data by camera_id
         camera_data.sort(key=lambda x: x["camera_id"])
        
-        # Prepare the response with the simplified format
+        # Sort manual adjustments by date
+        manual_adjustments_data.sort(key=lambda x: x["date"])
+       
+        # Prepare the response
         response_data = {
             "data": {
                 "total_entries": total_entries,
                 "total_exits": total_exits,
                 "total_count": total_count,
-                "camera_data": camera_data
+                "log_entries": log_entries,
+                "log_exits": log_exits,
+                "log_net_count": log_net_count,
+                "manual_entries": manual_entries,
+                "manual_exits": manual_exits,
+                "manual_adjustments_net_count": manual_adjustments_net_count,
+                "camera_data": camera_data,
+                "manual_adjustments": manual_adjustments_data
             }
         }
         if mode == "single":
@@ -2522,7 +2599,7 @@ async def get_person_count_by_date(req: func.HttpRequest) -> func.HttpResponse:
             json.dumps({"warn": f"An unexpected error occurred: {str(e)}"}),
             status_code=500,
             mimetype="application/json"
-        )   
+        )
     
 
 @app.route(route="update_organization_camera_data", methods=["PUT"])
@@ -3390,7 +3467,7 @@ async def add_user(req: func.HttpRequest) -> func.HttpResponse:
                 current_identities = current_user.get('identities', [])
                 current_identities.append({
                     "signInType": "emailAddress",
-                    "issuer": tenant_domain,  # Ensure this matches your B2C tenant configuration
+                    "issuer": tenant_domain,
                     "issuerAssignedId": email
                 })
                 identity_payload = {"identities": current_identities}
@@ -3414,6 +3491,8 @@ async def add_user(req: func.HttpRequest) -> func.HttpResponse:
                 json.dumps({
                     "data": {
                         "user_id": user_id,
+                        "azure_b2c_id": b2c_user_id,
+                        "credentials": {"email": email, "password": password},
                         "message": "User added successfully to database and Azure AD B2C, email sent successfully"
                     }
                 }),
@@ -3451,6 +3530,7 @@ async def add_user(req: func.HttpRequest) -> func.HttpResponse:
             mimetype="application/json",
             status_code=500
         )
+ 
    
 
 @app.function_name(name="getAllUsers")
@@ -4774,155 +4854,146 @@ def send_credentials_email(to_email: str, name: str, email: str, password: str):
         return False
 
 
-
-@app.function_name(name="getAllCameraStatus")
+def get_alert_info(
+    organization_id: str,
+    total_current_count: int,
+    setup_container: ContainerProxy
+) -> Tuple[bool, int, int, float]:
+    """
+    Calculate alert flag and related metrics for an organization.
+   
+    Args:
+        organization_id: The ID of the organization.
+        total_current_count: Sum of current counts across cameras.
+        setup_container: Cosmos DB container client for setup-details.
+   
+    Returns:
+        Tuple of (alert_flag, capacity, alert_message, occupancy_percentage).
+    """
+    try:
+        # Query capacity and alertMessage
+        setup_query = "SELECT c.capacityOfPeople, c.alertMessage FROM c WHERE c.organization_id = @org_id"
+        parameters = [{"name": "@org_id", "value": organization_id}]
+        setup_items = list(setup_container.query_items(
+            query=setup_query,
+            parameters=parameters,
+            enable_cross_partition_query=True
+        ))
+ 
+        capacity = setup_items[0].get("capacityOfPeople", 0) if setup_items else 0
+        alert_message_str = setup_items[0].get("alertMessage", "0") if setup_items else "0"
+ 
+        if capacity == 0:
+            logging.warning(f"No capacity defined for organization_id: {organization_id}")
+ 
+        # Parse alertMessage
+        try:
+            alert_message = int(float(alert_message_str.replace('%', '').strip()))
+        except (ValueError, AttributeError) as e:
+            logging.error(f"Failed to parse alertMessage '{alert_message_str}': {str(e)}")
+            alert_message = 0
+ 
+        # Calculate occupancy percentage
+        occupancy_percentage = (total_current_count / capacity * 100) if capacity > 0 else 0
+ 
+        # Determine alert flag
+        alert_flag = occupancy_percentage >= alert_message
+ 
+        return alert_flag, capacity, alert_message, round(occupancy_percentage, 2)
+ 
+    except Exception as e:
+        logging.error(f"Error calculating alert info: {type(e).__name__}: {str(e)}")
+        return False, 0, 0, 0.0
+    
+@app.function_name(name="getFailedCameraStatus")
 @app.route(route='api/getAllCameraStatus', methods=[func.HttpMethod.GET])
 @require_auth
 async def get_failed_camera_status(req: func.HttpRequest) -> func.HttpResponse:
     user_info = req.user_info
+    if not user_info or 'sub' not in user_info:
+        logging.error("Missing or invalid user_info in request")
+        return func.HttpResponse(
+            json.dumps({"status": "error", "detail": "Unauthorized: Missing user information"}),
+            mimetype="application/json",
+            status_code=401
+        )
+ 
     organization_id = user_info['sub']
-   
+    logging.info(f"Fetching failed camera statuses for organization_id: {organization_id}")
+ 
     try:
-        # Debug logging
-        logging.info(f"Fetching failed camera statuses for organization_id: {organization_id}")
-       
         # Initialize containers
-        users_container = database.get_container_client("users")
-        setup_container = database.get_container_client("setup-details")
-        user_counts_container = database.get_container_client("user_counts")
-       
-        # Query to get only failed camera statuses for the organization
+ 
+        # Query failed camera statuses
         query = "SELECT * FROM c WHERE c.user_id = @org_id AND c.status = 'failed'"
         query_params = [{"name": "@org_id", "value": organization_id}]
-        query_options = {'enable_cross_partition_query': True}
-       
-        # Query camera_status container
-        try:
-            items = list(camera_status_container.query_items(
-                query=query,
-                parameters=query_params,
-                **query_options
-            ))
-           
-            # Debug logging
-            logging.info(f"Query returned {len(items)} failed camera statuses")
-           
-            # Get total count of failed camera statuses
-            count_query = "SELECT VALUE COUNT(1) FROM c WHERE c.user_id = @org_id AND c.status = 'failed'"
-            count_params = [{"name": "@org_id", "value": organization_id}]
-            total_count = list(camera_status_container.query_items(
-                query=count_query,
-                parameters=count_params,
-                enable_cross_partition_query=True
-            ))[0]
-           
-            # If no items, log all failed camera statuses
-            if not items:
-                all_statuses = list(camera_status_container.query_items(
-                    query="SELECT * FROM c WHERE c.status = 'failed'",
-                    enable_cross_partition_query=True
-                ))
-                logging.info(f"Total failed camera statuses in container: {len(all_statuses)}")
-                for status in all_statuses:
-                    logging.info(f"Failed Camera Status: {status.get('id')} - User ID: {status.get('user_id')}")
-           
-            # Process failed camera statuses
-            camera_statuses = []
-            for status in items:
-                timestamp = status.get('timestamp')
-                try:
-                    if isinstance(timestamp, str):
-                        dt = isodate.parse_datetime(timestamp)
-                        readable_date = dt.strftime("%Y-%m-%d")
-                        readable_time = dt.strftime("%H:%M:%S")
-                    elif isinstance(timestamp, (int, float)):
-                        dt = datetime.fromtimestamp(timestamp)
-                        readable_date = dt.strftime("%Y-%m-%d")
-                        readable_time = dt.strftime("%H:%M:%S")
-                    else:
-                        readable_date = timestamp
-                        readable_time = timestamp
-                except Exception as e:
-                    logging.warning(f"Error parsing timestamp {timestamp}: {str(e)}")
-                    readable_date = timestamp
-                    readable_time = timestamp
-               
-                clean_status = {
-                    'id': status.get('id'),
-                    'user_id': status.get('user_id'),
-                    'camera_id': status.get('camera_id'),
-                    'videoUrl': status.get('videoUrl'),
-                    'status': status.get('status'),
-                    'date': readable_date,
-                    'time': readable_time
-                }
-                camera_statuses.append(clean_status)
-           
-            # Get organization_id from users container
-            user_query = "SELECT c.organization_id FROM c WHERE c.azure_b2c_id = @user_id"
-            user_params = [{"name": "@user_id", "value": organization_id}]
-            user_items = list(users_container.query_items(
-                query=user_query,
-                parameters=user_params,
-                enable_cross_partition_query=True
-            ))
-            org_id = user_items[0]['organization_id'] if user_items and 'organization_id' in user_items[0] else organization_id
-           
-            # Get capacity from setup container
-            capacity_query = "SELECT c.capacityOfPeople FROM c WHERE c.organization_id = @organization_id"
-            parameters = [{"name": "@organization_id", "value": org_id}]
-            setup_items = list(setup_container.query_items(
-                query=capacity_query,
-                parameters=parameters,
-                enable_cross_partition_query=True
-            ))
-            capacity = setup_items[0].get("capacityOfPeople", 0) if setup_items else 0
-           
-            # Get counts from user_counts container
-            counts_query = "SELECT c.cameras FROM c WHERE c.user_id = @organization_id"
-            count_items = list(user_counts_container.query_items(
-                query=counts_query,
-                parameters=parameters,
-                enable_cross_partition_query=True
-            ))
-           
-            # Calculate total current count
-            total_current_count = 0
-            if count_items:
-                cameras_data = count_items[0].get("cameras", {})
-                for camera_id, camera_data in cameras_data.items():
-                    entry = camera_data.get("entry_count", 0)
-                    exit = camera_data.get("exit_count", 0)
-                    total_current_count += entry - exit
-           
-            # Calculate occupancy percentage
-            occupancy_percentage = (total_current_count / capacity * 100) if capacity > 0 else 0
-           
-            # Get alertMessage from setupdetail container
-            alert_query = "SELECT c.alertMessage FROM c WHERE c.organization_id = @organization_id"
-            alert_items = list(setup_container.query_items(
-                query=alert_query,
-                parameters=parameters,
-                enable_cross_partition_query=True
-            ))
-            try:
-                alert_message_str = alert_items[0].get("alertMessage", "0") if alert_items else "0"
-                alert_message = int(alert_message_str.replace('%', '')) if alert_message_str else 0
-            except ValueError as e:
-                logging.error(f"Failed to convert alertMessage '{alert_message_str}' to integer: {str(e)}")
-                alert_message = 0
+        items = list(camera_status_container.query_items(
+            query=query,
+            parameters=query_params,
+            enable_cross_partition_query=True
+        ))
+        logging.info(f"Query returned {len(items)} failed camera statuses")
  
-            # Determine alert flag
-            alert_flag = occupancy_percentage >= alert_message
-           
-        except Exception as e:
-            logging.error(f"Cosmos DB Error: {type(e).__name__}: {str(e)}")
-            return func.HttpResponse(
-                json.dumps({"detail": f"Database error: {str(e)}"}),
-                mimetype="application/json",
-                status_code=500
-            )
-       
+        # Get total count
+        count_query = "SELECT VALUE COUNT(1) FROM c WHERE c.user_id = @org_id AND c.status = 'failed'"
+        total_count = list(camera_status_container.query_items(
+            query=count_query,
+            parameters=query_params,
+            enable_cross_partition_query=True
+        ))[0]
+ 
+        if not items:
+            logging.info(f"No failed camera statuses found for organization_id: {organization_id}")
+ 
+        # Process camera statuses
+        camera_statuses = []
+        for status in items:
+            timestamp = status.get('timestamp')
+            try:
+                if isinstance(timestamp, str):
+                    dt = isodate.parse_datetime(timestamp)
+                elif isinstance(timestamp, (int, float)):
+                    dt = datetime.fromtimestamp(timestamp)
+                else:
+                    raise ValueError("Invalid timestamp format")
+                readable_date = dt.strftime("%Y-%m-%d")
+                readable_time = dt.strftime("%H:%M:%S")
+            except Exception as e:
+                logging.warning(f"Error parsing timestamp {timestamp}: {str(e)}")
+                readable_date = "Unknown"
+                readable_time = "Unknown"
+ 
+            camera_statuses.append({
+                'id': status.get('id'),
+                'user_id': status.get('user_id'),
+                'camera_id': status.get('camera_id'),
+                'videoUrl': status.get('videoUrl'),
+                'status': status.get('status'),
+                'date': readable_date,
+                'time': readable_time
+            })
+ 
+        # Get counts
+        counts_query = "SELECT c.cameras FROM c WHERE c.user_id = @org_id"
+        count_items = list(user_counts_container.query_items(
+            query=counts_query,
+            parameters=query_params,
+            enable_cross_partition_query=True
+        ))
+ 
+        total_current_count = 0
+        if count_items:
+            cameras_data = count_items[0].get("cameras", {})
+            for camera_id, camera_data in cameras_data.items():
+                entry = camera_data.get("entry_count", 0)
+                exit = camera_data.get("exit_count", 0)
+                total_current_count += entry - exit
+ 
+        # Get alert info
+        alert_flag, capacity, alert_message, occupancy_percentage = get_alert_info(
+            organization_id, total_current_count, setup_container
+        )
+ 
         # Prepare response
         response = {
             "data": {
@@ -4935,21 +5006,19 @@ async def get_failed_camera_status(req: func.HttpRequest) -> func.HttpResponse:
                 "occupancy_percentage": occupancy_percentage
             }
         }
-       
         return func.HttpResponse(
             json.dumps(response),
             mimetype="application/json",
             status_code=200
         )
-       
+ 
     except Exception as e:
         logging.error(f"Error getting failed camera statuses: {type(e).__name__}: {str(e)}")
         return func.HttpResponse(
-            json.dumps({"detail": f"An error occurred while getting failed camera statuses: {str(e)}"}),
+            json.dumps({"status": "error", "detail": f"An error occurred: {str(e)}"}),
             mimetype="application/json",
             status_code=500
         )
-
 
 
 @app.function_name(name="editPersonCountByDate")
@@ -4977,13 +5046,19 @@ async def edit_person_count_by_date(req: func.HttpRequest) -> func.HttpResponse:
        
         # Validate required parameters
         date_param = req_body.get('date')
-        camera_id = req_body.get('camera_id')
         new_entries = req_body.get('entries')
         new_exits = req_body.get('exits')
        
-        if not all([date_param, camera_id, new_entries is not None, new_exits is not None]):
+        if not date_param:
             return func.HttpResponse(
-                json.dumps({"error": "Missing required parameters: date, camera_id, entries, and exits"}),
+                json.dumps({"error": "Missing required parameter: date"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+       
+        if new_entries is None and new_exits is None:
+            return func.HttpResponse(
+                json.dumps({"error": "At least one of entries or exits must be provided"}),
                 status_code=400,
                 mimetype="application/json"
             )
@@ -4998,19 +5073,27 @@ async def edit_person_count_by_date(req: func.HttpRequest) -> func.HttpResponse:
                 mimetype="application/json"
             )
        
-        # Validate count values
+        # Validate count value
         try:
-            new_entries = int(new_entries)
-            new_exits = int(new_exits)
-            if new_entries < 0 or new_exits < 0:
-                return func.HttpResponse(
-                    json.dumps({"error": "Entries and exits must be non-negative integers"}),
-                    status_code=400,
-                    mimetype="application/json"
-                )
+            if new_entries is not None:
+                new_entries = int(new_entries)
+                if new_entries < 0:
+                    return func.HttpResponse(
+                        json.dumps({"error": "Entries must be non-negative integer"}),
+                        status_code=400,
+                        mimetype="application/json"
+                    )
+            if new_exits is not None:
+                new_exits = int(new_exits)
+                if new_exits < 0:
+                    return func.HttpResponse(
+                        json.dumps({"error": "Exits must be non-negative integer"}),
+                        status_code=400,
+                        mimetype="application/json"
+                    )
         except (ValueError, TypeError):
             return func.HttpResponse(
-                json.dumps({"error": "Entries and exits must be valid integers"}),
+                json.dumps({"error": "Entries or exits must be valid integers"}),
                 status_code=400,
                 mimetype="application/json"
             )
@@ -5042,60 +5125,62 @@ async def edit_person_count_by_date(req: func.HttpRequest) -> func.HttpResponse:
        
         # Prepare the updated document
         if logs_items:
-            # Existing document found
             doc = logs_items[0]
             logs = doc.get("logs", [])
-            editable_counts = doc.get("editable_counts", [])
+            manual_adjustments = doc.get("manual_adjustments", [])
         else:
-            # Create new document
             doc = {
                 "id": organization_id,
                 "user_id": organization_id,
                 "logs": [],
-                "editable_counts": []
+                "manual_adjustments": []
             }
             logs = []
-            editable_counts = []
+            manual_adjustments = []
        
-        # Check if there's an existing editable count for this date and camera
-        existing_count_index = next(
-            (i for i, count in enumerate(editable_counts)
-             if count.get("date") == selected_date and count.get("camera_id") == camera_id),
+        # Check if there's an existing manual adjustment for this date
+        existing_adjustment_index = next(
+            (i for i, adjustment in enumerate(manual_adjustments)
+             if adjustment.get("date") == selected_date),
             None
         )
        
-        # Prepare the new editable count entry
-        new_count_entry = {
-            "date": selected_date,
-            "camera_id": camera_id,
-            "entries": new_entries,
-            "exits": new_exits,
-            "net_count": new_entries - new_exits,
-            "updated_at": pendulum.now().to_iso8601_string()
-        }
-       
-        # Update or append the editable count
-        if existing_count_index is not None:
-            editable_counts[existing_count_index] = new_count_entry
+        # Prepare the new manual adjustment entry
+        if existing_adjustment_index is not None:
+            # Use existing values for unchanged field
+            existing_entry = manual_adjustments[existing_adjustment_index]
+            current_entries = existing_entry.get("entries", 0)
+            current_exits = existing_entry.get("exits", 0)
+           
+            new_adjustment_entry = {
+                "date": selected_date,
+                "entries": new_entries if new_entries is not None else current_entries,
+                "exits": new_exits if new_exits is not None else current_exits,
+                "updated_at": pendulum.now().to_iso8601_string()
+            }
+            manual_adjustments[existing_adjustment_index] = new_adjustment_entry
         else:
-            editable_counts.append(new_count_entry)
+            # New entry, set default 0 for unchanged field
+            new_adjustment_entry = {
+                "date": selected_date,
+                "entries": new_entries if new_entries is not None else 0,
+                "exits": new_exits if new_exits is not None else 0,
+                "updated_at": pendulum.now().to_iso8601_string()
+            }
+            manual_adjustments.append(new_adjustment_entry)
        
-        # Update the document with new editable counts
-        doc["editable_counts"] = editable_counts
+        # Update the document with new manual adjustments
+        doc["manual_adjustments"] = manual_adjustments
        
         # Upsert the document
         user_logs_container.upsert_item(doc)
        
         # Prepare response
         response_data = {
-            "data": {
-                "date": selected_date,
-                "camera_id": camera_id,
-                "entries": new_entries,
-                "exits": new_exits,
-                "net_count": new_entries - new_exits,
-                "updated_at": new_count_entry["updated_at"]
-            }
+            "date": selected_date,
+            "updated_at": new_adjustment_entry["updated_at"],
+            "entries": new_adjustment_entry["entries"],
+            "exits":new_adjustment_entry["exits"]
         }
        
         return func.HttpResponse(
@@ -5113,6 +5198,246 @@ async def edit_person_count_by_date(req: func.HttpRequest) -> func.HttpResponse:
         )
     except Exception as e:
         logging.error(f"Unexpected error in putPersonCountByDate: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"error": f"An unexpected error occurred: {str(e)}"}),
+            status_code=500,
+            mimetype="application/json"
+        )
+
+
+@app.function_name(name="getFailedCameraStatusAttendance")
+@app.route(route='api/getFailedCameraStatusAttendance', methods=[func.HttpMethod.GET])
+@require_auth
+async def get_failed_camera_status(req: func.HttpRequest) -> func.HttpResponse:
+    user_info = req.user_info
+    if not user_info or 'sub' not in user_info:
+        logging.error("Missing or invalid user_info in request")
+        return func.HttpResponse(
+            json.dumps({"status": "error", "detail": "Unauthorized: Missing user information"}),
+            mimetype="application/json",
+            status_code=401
+        )
+ 
+    organization_id = user_info['sub']
+    logging.info(f"Fetching failed camera statuses for organization_id: {organization_id}")
+ 
+    try:
+        # Query failed camera statuses
+        query = "SELECT * FROM c WHERE c.organizationId = @org_id AND c.status = 'offline'"
+        query_params = [{"name": "@org_id", "value": organization_id}]
+        items = list(camera_status_container_attendance.query_items(
+            query=query,
+            parameters=query_params,
+            enable_cross_partition_query=True
+        ))
+        logging.info(f"Query returned {len(items)} failed camera statuses")
+ 
+        if not items:
+            logging.info(f"No failed camera statuses found for organization_id: {organization_id}")
+ 
+        # Process camera statuses
+        camera_statuses = []
+        for status in items:
+            # Map status: "offline" to "failed"
+            display_status = "failed" if status.get('status') == "offline" else status.get('status')
+           
+            timestamp = status.get('lastUpdated')
+            try:
+                if isinstance(timestamp, str):
+                    dt = isodate.parse_datetime(timestamp)
+                elif isinstance(timestamp, (int, float)):
+                    dt = datetime.fromtimestamp(timestamp)
+                else:
+                    raise ValueError("Invalid timestamp format")
+                readable_date = dt.strftime("%Y-%m-%d")
+                readable_time = dt.strftime("%H:%M:%S")
+            except Exception as e:
+                logging.warning(f"Error parsing timestamp {timestamp}: {str(e)}")
+                readable_date = "Unknown"
+                readable_time = "Unknown"
+ 
+            # Determine camera direction (punchinCamera or punchoutCamera)
+            camera_direction = status.get('punchinCamera') or status.get('punchoutCamera') or "Unknown"
+ 
+            camera_statuses.append({
+                'id': status.get('id'),
+                'user_id': status.get('organizationId'),
+                'camera_id': status.get('cameraId'),
+                'videoUrl': status.get('url'),
+                'status': display_status,
+                'camera_type': status.get('cameraType'),
+                'date': readable_date,
+                'time': readable_time,
+                'camera_name': camera_direction  # Add camera direction
+            })
+ 
+        # Prepare response
+        response = {
+            "data": {
+                "camera_statuses": camera_statuses,
+                "total_count": len(items)
+            }
+        }
+        return func.HttpResponse(
+            json.dumps(response),
+            mimetype="application/json",
+            status_code=200
+        )
+ 
+    except Exception as e:
+        logging.error(f"Error getting failed camera statuses: {type(e).__name__}: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"status": "error", "detail": f"An error occurred: {str(e)}"}),
+            mimetype="application/json",
+            status_code=500
+        )
+ 
+ 
+
+@app.function_name(name="resetManualAdjustments")
+@app.route(route='api/resetManualAdjustments', methods=[func.HttpMethod.POST])
+@require_auth
+async def reset_manual_adjustments(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        user_info = req.user_info
+        user_id = user_info['sub']
+       
+        # Initialize containers
+        users_container = database.get_container_client(USERS)
+        user_logs_container = database.get_container_client(USER_LOGS)
+       
+        # Get request body
+        try:
+            req_body = req.get_json()
+        except ValueError:
+            return func.HttpResponse(
+                json.dumps({"error": "Invalid JSON in request body"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+       
+        # Extract date parameters from the request body
+        date_param = req_body.get('date')
+        start_date_param = req_body.get('start_date')
+        end_date_param = req_body.get('end_date')
+       
+        # Validate that at least one date parameter is provided
+        if not (date_param or (start_date_param and end_date_param)):
+            return func.HttpResponse(
+                json.dumps({"error": "Either 'date' or both 'start_date' and 'end_date' must be provided in the request body"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+       
+        # Determine reset mode (single date or range)
+        if start_date_param and end_date_param:
+            try:
+                start_date = pendulum.parse(start_date_param).start_of('day')
+                end_date = pendulum.parse(end_date_param).end_of('day')
+                if start_date > end_date:
+                    return func.HttpResponse(
+                        json.dumps({"error": "start_date cannot be after end_date"}),
+                        status_code=400,
+                        mimetype="application/json"
+                    )
+                mode = "range"
+            except Exception as e:
+                return func.HttpResponse(
+                    json.dumps({"error": f"Invalid date format for start_date or end_date. Please use YYYY-MM-DD. Details: {str(e)}"}),
+                    status_code=400,
+                    mimetype="application/json"
+                )
+        elif date_param:
+            try:
+                selected_date = pendulum.parse(date_param).start_of('day')
+                start_date = selected_date
+                end_date = selected_date.end_of('day')
+                mode = "single"
+            except Exception as e:
+                return func.HttpResponse(
+                    json.dumps({"error": f"Invalid date format. Please use YYYY-MM-DD. Details: {str(e)}"}),
+                    status_code=400,
+                    mimetype="application/json"
+                )
+       
+        # Get organization_id from users container
+        user_query = "SELECT c.organization_id FROM c WHERE c.organization_id = @user_id"
+        user_params = [{"name": "@user_id", "value": user_id}]
+       
+        user_items = list(users_container.query_items(
+            query=user_query,
+            parameters=user_params,
+            enable_cross_partition_query=True
+        ))
+       
+        if not user_items or 'organization_id' not in user_items[0]:
+            return func.HttpResponse(
+                json.dumps({"error": "User or organization not found"}),
+                status_code=404,
+                mimetype="application/json"
+            )
+       
+        organization_id = user_items[0]['organization_id']
+       
+        # Find the user_logs document for the organization
+        logs_query = "SELECT * FROM c WHERE c.user_id = @organization_id"
+        logs_params = [{"name": "@organization_id", "value": organization_id}]
+       
+        log_items = list(user_logs_container.query_items(
+            query=logs_query,
+            parameters=logs_params,
+            enable_cross_partition_query=True
+        ))
+       
+        if not log_items:
+            return func.HttpResponse(
+                json.dumps({"error": "No logs found for the organization"}),
+                status_code=404,
+                mimetype="application/json"
+            )
+       
+        # Update the document by filtering manual_adjustments
+        log_document = log_items[0]
+        manual_adjustments = log_document.get('manual_adjustments', [])
+       
+        filtered_adjustments = []
+        for adjustment in manual_adjustments:
+            try:
+                adjustment_date = pendulum.parse(adjustment.get("date")).start_of('day')
+                if not (start_date <= adjustment_date <= end_date):
+                    filtered_adjustments.append(adjustment)
+            except Exception as parse_error:
+                logging.warning(f"Failed to parse manual adjustment date {adjustment.get('date')}: {str(parse_error)}")
+                filtered_adjustments.append(adjustment)  # Keep invalid dates
+        log_document['manual_adjustments'] = filtered_adjustments
+       
+        # Replace the document in the container
+        user_logs_container.replace_item(
+            item=log_document['id'],
+            body=log_document
+        )
+       
+        # Prepare response message
+        response_data = {
+            "message": "Manual adjustments successfully reset",
+            "organization_id": organization_id
+        }
+        if mode == "single":
+            response_data["date"] = start_date.format('YYYY-MM-DD')
+        elif mode == "range":
+            response_data["date_range"] = {
+                "start_date": start_date.format('YYYY-MM-DD'),
+                "end_date": end_date.format('YYYY-MM-DD')
+            }
+       
+        return func.HttpResponse(
+            json.dumps(response_data),
+            status_code=200,
+            mimetype="application/json"
+        )
+   
+    except Exception as e:
+        logging.error(f"Unexpected error in resetManualAdjustments: {str(e)}")
         return func.HttpResponse(
             json.dumps({"error": f"An unexpected error occurred: {str(e)}"}),
             status_code=500,
